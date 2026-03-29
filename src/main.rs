@@ -34,6 +34,10 @@ struct Args {
     /// Enable rudimentary XML syntax highlighting.
     #[arg(long)]
     xml: bool,
+
+    /// Enable rudimentary JSON syntax highlighting.
+    #[arg(long)]
+    json: bool,
 }
 
 struct Viewer {
@@ -44,6 +48,7 @@ struct Viewer {
     tab_width: usize,
     csv_column_widths: Option<Vec<usize>>,
     xml_syntax_highlighting: bool,
+    json_syntax_highlighting: bool,
     search_query: Option<Vec<u8>>,
     match_range: Option<(usize, usize)>,
 }
@@ -56,6 +61,16 @@ enum XmlTokenClass {
     AttributeName,
     AttributeValue,
     Comment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum JsonTokenClass {
+    Text,
+    Delimiter,
+    Key,
+    String,
+    Number,
+    Keyword,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -83,6 +98,7 @@ impl Viewer {
         tab_width: usize,
         csv: bool,
         xml_syntax_highlighting: bool,
+        json_syntax_highlighting: bool,
     ) -> Result<Self> {
         let file = File::open(&path)
             .with_context(|| format!("Failed to open file: {}", path.display()))?;
@@ -104,6 +120,7 @@ impl Viewer {
             tab_width,
             csv_column_widths,
             xml_syntax_highlighting,
+            json_syntax_highlighting,
             search_query: None,
             match_range: None,
         })
@@ -248,9 +265,16 @@ impl Viewer {
         let mut segments: Vec<(bool, RenderClass, String)> = Vec::new();
         let mut visible_width = 0usize;
         let mut absolute_col = 0usize;
-        let xml_classes = (!self.xml_syntax_highlighting || self.csv_column_widths.is_some())
+        let xml_classes = (!self.xml_syntax_highlighting
+            || self.csv_column_widths.is_some()
+            || self.json_syntax_highlighting)
             .then(Vec::new)
             .unwrap_or_else(|| classify_xml_line(bytes));
+        let json_classes = (!self.json_syntax_highlighting
+            || self.csv_column_widths.is_some()
+            || self.xml_syntax_highlighting)
+            .then(Vec::new)
+            .unwrap_or_else(|| classify_json_line(bytes));
 
         let mut push_char = |c: char, is_highlight: bool, render_class: RenderClass| {
             if absolute_col < self.left_col {
@@ -326,13 +350,24 @@ impl Viewer {
                     .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
                     .unwrap_or(false);
                 let render_class =
-                    match xml_classes.get(idx).copied().unwrap_or(XmlTokenClass::Text) {
-                        XmlTokenClass::Text => RenderClass::Text,
-                        XmlTokenClass::TagDelimiter => RenderClass::TagDelimiter,
-                        XmlTokenClass::TagName => RenderClass::TagName,
-                        XmlTokenClass::AttributeName => RenderClass::AttributeName,
-                        XmlTokenClass::AttributeValue => RenderClass::AttributeValue,
-                        XmlTokenClass::Comment => RenderClass::Comment,
+                    if self.json_syntax_highlighting {
+                        match json_classes.get(idx).copied().unwrap_or(JsonTokenClass::Text) {
+                            JsonTokenClass::Text => RenderClass::Text,
+                            JsonTokenClass::Delimiter => RenderClass::TagDelimiter,
+                            JsonTokenClass::Key => RenderClass::AttributeName,
+                            JsonTokenClass::String => RenderClass::AttributeValue,
+                            JsonTokenClass::Number => RenderClass::TagName,
+                            JsonTokenClass::Keyword => RenderClass::Comment,
+                        }
+                    } else {
+                        match xml_classes.get(idx).copied().unwrap_or(XmlTokenClass::Text) {
+                            XmlTokenClass::Text => RenderClass::Text,
+                            XmlTokenClass::TagDelimiter => RenderClass::TagDelimiter,
+                            XmlTokenClass::TagName => RenderClass::TagName,
+                            XmlTokenClass::AttributeName => RenderClass::AttributeName,
+                            XmlTokenClass::AttributeValue => RenderClass::AttributeValue,
+                            XmlTokenClass::Comment => RenderClass::Comment,
+                        }
                     };
 
                 match b {
@@ -535,9 +570,89 @@ fn classify_xml_line(bytes: &[u8]) -> Vec<XmlTokenClass> {
     classes
 }
 
+fn classify_json_line(bytes: &[u8]) -> Vec<JsonTokenClass> {
+    let mut classes = vec![JsonTokenClass::Text; bytes.len()];
+    let mut idx = 0usize;
+    let mut expecting_key = true;
+
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        match b {
+            b'{' | b'}' | b'[' | b']' | b':' | b',' => {
+                classes[idx] = JsonTokenClass::Delimiter;
+                if b == b'{' || b == b',' {
+                    expecting_key = true;
+                } else if b == b':' || b == b'[' {
+                    expecting_key = false;
+                }
+                idx += 1;
+            }
+            b'"' => {
+                let class = if expecting_key {
+                    JsonTokenClass::Key
+                } else {
+                    JsonTokenClass::String
+                };
+                classes[idx] = class;
+                idx += 1;
+                let mut escaped = false;
+                while idx < bytes.len() {
+                    classes[idx] = class;
+                    let ch = bytes[idx];
+                    if escaped {
+                        escaped = false;
+                    } else if ch == b'\\' {
+                        escaped = true;
+                    } else if ch == b'"' {
+                        idx += 1;
+                        break;
+                    }
+                    idx += 1;
+                }
+                expecting_key = false;
+            }
+            b'-' | b'0'..=b'9' => {
+                let start = idx;
+                idx += 1;
+                while idx < bytes.len() && matches!(bytes[idx], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') {
+                    idx += 1;
+                }
+                for class in classes.iter_mut().take(idx).skip(start) {
+                    *class = JsonTokenClass::Number;
+                }
+                expecting_key = false;
+            }
+            b't' if bytes[idx..].starts_with(b"true") => {
+                for class in classes.iter_mut().take(idx + 4).skip(idx) {
+                    *class = JsonTokenClass::Keyword;
+                }
+                idx += 4;
+                expecting_key = false;
+            }
+            b'f' if bytes[idx..].starts_with(b"false") => {
+                for class in classes.iter_mut().take(idx + 5).skip(idx) {
+                    *class = JsonTokenClass::Keyword;
+                }
+                idx += 5;
+                expecting_key = false;
+            }
+            b'n' if bytes[idx..].starts_with(b"null") => {
+                for class in classes.iter_mut().take(idx + 4).skip(idx) {
+                    *class = JsonTokenClass::Keyword;
+                }
+                idx += 4;
+                expecting_key = false;
+            }
+            _ => idx += 1,
+        }
+    }
+
+    classes
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut viewer = Viewer::open(args.file, args.tab_width, args.csv, args.xml)?;
+    let mut viewer = Viewer::open(args.file, args.tab_width, args.csv, args.xml, args.json)?;
 
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -764,7 +879,10 @@ fn prompt_find(viewer: &Viewer, out: &mut impl Write) -> Result<Option<String>> 
 
 #[cfg(test)]
 mod tests {
-    use super::{centered_top_line, classify_xml_line, skipped_prefix_len, Viewer, XmlTokenClass};
+    use super::{
+        JsonTokenClass, Viewer, XmlTokenClass, centered_top_line, classify_json_line,
+        classify_xml_line, skipped_prefix_len,
+    };
     use std::{
         fs,
         path::PathBuf,
@@ -823,7 +941,8 @@ mod tests {
         let path: PathBuf =
             std::env::temp_dir().join(format!("large-file-viewer-test-{nonce}.txt"));
         fs::write(&path, bytes).expect("failed to write temp file");
-        let viewer = Viewer::open(path.clone(), 4, false, false).expect("failed to open viewer");
+        let viewer =
+            Viewer::open(path.clone(), 4, false, false, false).expect("failed to open viewer");
         fs::remove_file(path).expect("failed to remove temp file");
         viewer
     }
@@ -856,7 +975,7 @@ mod tests {
             std::env::temp_dir().join(format!("large-file-viewer-test-{nonce}.txt"));
         fs::write(&path, bytes).expect("failed to write temp file");
         let viewer =
-            Viewer::open(path.clone(), tab_width, csv, false).expect("failed to open viewer");
+            Viewer::open(path.clone(), tab_width, csv, false, false).expect("failed to open viewer");
         fs::remove_file(path).expect("failed to remove temp file");
         viewer
     }
@@ -887,5 +1006,40 @@ mod tests {
         assert_eq!(skipped_prefix_len(0, &bom_prefixed), 3);
         assert_eq!(skipped_prefix_len(1, &bom_prefixed), 0);
         assert_eq!(skipped_prefix_len(0, b"<x>"), 0);
+    }
+
+    #[test]
+    fn classifies_json_tokens() {
+        let json = br#"{"name":"bob","age":42,"ok":true,"v":null}"#;
+        let classes = classify_json_line(json);
+
+        let first_colon = json
+            .iter()
+            .position(|&b| b == b':')
+            .expect("json should contain colon");
+        let age_index = json
+            .windows(3)
+            .position(|w| w == b"age")
+            .expect("json should contain age");
+        let number_index = json
+            .iter()
+            .position(|&b| b == b'4')
+            .expect("json should contain number");
+        let true_index = json
+            .windows(4)
+            .position(|w| w == b"true")
+            .expect("json should contain true");
+        let null_index = json
+            .windows(4)
+            .position(|w| w == b"null")
+            .expect("json should contain null");
+
+        assert_eq!(classes[0], JsonTokenClass::Delimiter);
+        assert_eq!(classes[1], JsonTokenClass::Key);
+        assert_eq!(classes[first_colon], JsonTokenClass::Delimiter);
+        assert_eq!(classes[age_index], JsonTokenClass::Key);
+        assert_eq!(classes[number_index], JsonTokenClass::Number);
+        assert_eq!(classes[true_index], JsonTokenClass::Keyword);
+        assert_eq!(classes[null_index], JsonTokenClass::Keyword);
     }
 }
