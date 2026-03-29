@@ -351,7 +351,7 @@ impl Viewer {
                 let styled = match render_class {
                     RenderClass::Text => style::style(text).with(Color::White).reverse(),
                     RenderClass::TagDelimiter => style::style(text).with(Color::Cyan).reverse(),
-                    RenderClass::TagName => style::style(text).with(Color::Magenta).reverse(),
+                    RenderClass::TagName => style::style(text).with(Color::DarkYellow).reverse(),
                     RenderClass::AttributeName => style::style(text).with(Color::Green).reverse(),
                     RenderClass::AttributeValue => style::style(text).with(Color::Yellow).reverse(),
                     RenderClass::Comment => style::style(text).with(Color::DarkGrey).reverse(),
@@ -361,7 +361,7 @@ impl Viewer {
                 let styled = match render_class {
                     RenderClass::Text => style::style(text).with(Color::White),
                     RenderClass::TagDelimiter => style::style(text).with(Color::Cyan),
-                    RenderClass::TagName => style::style(text).with(Color::Magenta),
+                    RenderClass::TagName => style::style(text).with(Color::DarkYellow),
                     RenderClass::AttributeName => style::style(text).with(Color::Green),
                     RenderClass::AttributeValue => style::style(text).with(Color::Yellow),
                     RenderClass::Comment => style::style(text).with(Color::DarkGrey),
