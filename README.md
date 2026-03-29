@@ -27,6 +27,13 @@ If you are already on Windows x64 with Rust MSVC toolchain installed, this gener
 cargo run -- path/to/very_large_file.log
 ```
 
+Useful options:
+
+- `--csv`: align comma-separated fields into columns.
+- `--xml`: enable rudimentary XML syntax highlighting.
+- `--json`: enable rudimentary JSON syntax highlighting.
+- `--tab-width N`: set visual tab width (default: 4).
+
 ### Controls
 
 - `q`: quit
