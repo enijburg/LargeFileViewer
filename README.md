@@ -31,6 +31,7 @@ Useful options:
 
 - `--csv`: align comma-separated fields into columns.
 - `--xml`: enable rudimentary XML syntax highlighting.
+- `--format`: when used with `--xml`, adds indentation based on XML tag depth.
 - `--json`: enable rudimentary JSON syntax highlighting.
 - `--tab-width N`: set visual tab width (default: 4).
 

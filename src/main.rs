@@ -35,6 +35,10 @@ struct Args {
     #[arg(long)]
     xml: bool,
 
+    /// In XML mode, indent lines based on tag depth.
+    #[arg(long)]
+    format: bool,
+
     /// Enable rudimentary JSON syntax highlighting.
     #[arg(long)]
     json: bool,
@@ -48,6 +52,7 @@ struct Viewer {
     tab_width: usize,
     csv_column_widths: Option<Vec<usize>>,
     xml_syntax_highlighting: bool,
+    xml_line_indentation: Option<Vec<usize>>,
     json_syntax_highlighting: bool,
     search_query: Option<Vec<u8>>,
     match_range: Option<(usize, usize)>,
@@ -98,6 +103,7 @@ impl Viewer {
         tab_width: usize,
         csv: bool,
         xml_syntax_highlighting: bool,
+        xml_formatting: bool,
         json_syntax_highlighting: bool,
     ) -> Result<Self> {
         let file = File::open(&path)
@@ -109,6 +115,9 @@ impl Viewer {
 
         let line_offsets = Self::index_lines(&mmap);
         let csv_column_widths = csv.then(|| Self::index_csv_column_widths(&mmap, tab_width));
+        let xml_line_indentation =
+            (xml_syntax_highlighting && xml_formatting && !csv && !json_syntax_highlighting)
+                .then(|| Self::index_xml_line_indentation(&mmap, &line_offsets));
 
         let top_line = if csv && line_offsets.len() > 1 { 1 } else { 0 };
 
@@ -120,6 +129,7 @@ impl Viewer {
             tab_width,
             csv_column_widths,
             xml_syntax_highlighting,
+            xml_line_indentation,
             json_syntax_highlighting,
             search_query: None,
             match_range: None,
@@ -177,6 +187,36 @@ impl Viewer {
         }
         widths[column] = widths[column].max(current_width);
         widths
+    }
+
+    fn index_xml_line_indentation(bytes: &[u8], line_offsets: &[usize]) -> Vec<usize> {
+        let mut indentation = vec![0usize; line_offsets.len()];
+        let mut depth = 0usize;
+
+        for (line_idx, &line_start) in line_offsets.iter().enumerate() {
+            let line_end = if line_idx + 1 < line_offsets.len() {
+                line_offsets[line_idx + 1]
+            } else {
+                bytes.len()
+            };
+            let line = &bytes[line_start..line_end];
+            let (starts_with_closing_tag, net_delta) = analyze_xml_line_indentation(line);
+
+            let this_line_depth = if starts_with_closing_tag {
+                depth.saturating_sub(1)
+            } else {
+                depth
+            };
+            indentation[line_idx] = this_line_depth;
+
+            if net_delta.is_negative() {
+                depth = depth.saturating_sub(net_delta.unsigned_abs());
+            } else {
+                depth = depth.saturating_add(net_delta as usize);
+            }
+        }
+
+        indentation
     }
 
     fn render(&self, out: &mut impl Write) -> Result<()> {
@@ -340,6 +380,13 @@ impl Viewer {
                 }
             }
         } else {
+            if let Some(indentation) = &self.xml_line_indentation {
+                let indent_spaces = indentation.get(line_idx).copied().unwrap_or(0) * 2;
+                for _ in 0..indent_spaces {
+                    push_char(' ', false, RenderClass::Text);
+                }
+            }
+
             for (idx, &b) in bytes.iter().enumerate().skip(content_start) {
                 if b == b'\n' || b == b'\r' {
                     continue;
@@ -655,9 +702,110 @@ fn classify_json_line(bytes: &[u8]) -> Vec<JsonTokenClass> {
     classes
 }
 
+fn analyze_xml_line_indentation(line: &[u8]) -> (bool, isize) {
+    let mut starts_with_closing_tag = false;
+    let mut in_comment = false;
+    let mut idx = skipped_prefix_len(0, line);
+    while idx < line.len() {
+        if line[idx].is_ascii_whitespace() {
+            idx += 1;
+            continue;
+        }
+        if idx + 3 < line.len() && line[idx..].starts_with(b"<!--") {
+            in_comment = true;
+            break;
+        }
+        if line[idx] == b'<' {
+            starts_with_closing_tag = idx + 1 < line.len() && line[idx + 1] == b'/';
+        }
+        break;
+    }
+
+    let mut delta = 0isize;
+    let mut pos = 0usize;
+    while pos < line.len() {
+        if in_comment {
+            if pos + 2 < line.len() && line[pos..].starts_with(b"-->") {
+                pos += 3;
+                in_comment = false;
+            } else {
+                pos += 1;
+            }
+            continue;
+        }
+
+        if pos + 3 < line.len() && line[pos..].starts_with(b"<!--") {
+            in_comment = true;
+            pos += 4;
+            continue;
+        }
+
+        if line[pos] != b'<' {
+            pos += 1;
+            continue;
+        }
+
+        if pos + 1 >= line.len() {
+            break;
+        }
+
+        if line[pos + 1] == b'/' {
+            delta -= 1;
+            pos += 2;
+            continue;
+        }
+
+        if matches!(line[pos + 1], b'!' | b'?') {
+            pos += 2;
+            continue;
+        }
+
+        let mut tag_end = pos + 1;
+        let mut in_quote: Option<u8> = None;
+        while tag_end < line.len() {
+            let b = line[tag_end];
+            if let Some(quote) = in_quote {
+                if b == quote {
+                    in_quote = None;
+                }
+            } else if b == b'"' || b == b'\'' {
+                in_quote = Some(b);
+            } else if b == b'>' {
+                break;
+            }
+            tag_end += 1;
+        }
+
+        if tag_end >= line.len() {
+            break;
+        }
+
+        let mut tail = tag_end;
+        while tail > pos && line[tail - 1].is_ascii_whitespace() {
+            tail -= 1;
+        }
+        let self_closing = tail > pos && line[tail - 1] == b'/';
+
+        if !self_closing {
+            delta += 1;
+        }
+
+        pos = tag_end + 1;
+    }
+
+    (starts_with_closing_tag, delta)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut viewer = Viewer::open(args.file, args.tab_width, args.csv, args.xml, args.json)?;
+    let mut viewer = Viewer::open(
+        args.file,
+        args.tab_width,
+        args.csv,
+        args.xml,
+        args.format,
+        args.json,
+    )?;
 
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -885,8 +1033,8 @@ fn prompt_find(viewer: &Viewer, out: &mut impl Write) -> Result<Option<String>> 
 #[cfg(test)]
 mod tests {
     use super::{
-        centered_top_line, classify_json_line, classify_xml_line, skipped_prefix_len,
-        JsonTokenClass, Viewer, XmlTokenClass,
+        analyze_xml_line_indentation, centered_top_line, classify_json_line, classify_xml_line,
+        skipped_prefix_len, JsonTokenClass, Viewer, XmlTokenClass,
     };
     use std::{
         fs,
@@ -952,7 +1100,7 @@ mod tests {
 
     fn test_viewer_from_bytes(bytes: &[u8]) -> Viewer {
         with_temp_file(bytes, |path| {
-            Viewer::open(path, 4, false, false, false).expect("failed to open viewer")
+            Viewer::open(path, 4, false, false, false, false).expect("failed to open viewer")
         })
     }
 
@@ -977,7 +1125,7 @@ mod tests {
 
     fn test_viewer_with_options(bytes: &[u8], tab_width: usize, csv: bool) -> Viewer {
         with_temp_file(bytes, |path| {
-            Viewer::open(path, tab_width, csv, false, false).expect("failed to open viewer")
+            Viewer::open(path, tab_width, csv, false, false, false).expect("failed to open viewer")
         })
     }
 
@@ -1042,5 +1190,28 @@ mod tests {
         assert_eq!(classes[number_index], JsonTokenClass::Number);
         assert_eq!(classes[true_index], JsonTokenClass::Keyword);
         assert_eq!(classes[null_index], JsonTokenClass::Keyword);
+    }
+
+    #[test]
+    fn tracks_xml_indentation_depth_by_line() {
+        let xml = br#"<root>
+<parent>
+<child/>
+</parent>
+</root>"#;
+        let offsets = Viewer::index_lines(xml);
+        let indentation = Viewer::index_xml_line_indentation(xml, &offsets);
+        assert_eq!(indentation, vec![0, 1, 2, 1, 0]);
+    }
+
+    #[test]
+    fn analyzes_xml_indentation_for_closing_tag_and_self_closing_tag() {
+        let (starts_closing, delta) = analyze_xml_line_indentation(br#"  </node>"#);
+        assert!(starts_closing);
+        assert_eq!(delta, -1);
+
+        let (starts_closing, delta) = analyze_xml_line_indentation(br#"  <node attr="x"/>"#);
+        assert!(!starts_closing);
+        assert_eq!(delta, 0);
     }
 }
