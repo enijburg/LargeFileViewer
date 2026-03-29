@@ -31,7 +31,7 @@ Useful options:
 
 - `--csv`: align comma-separated fields into columns.
 - `--xml`: enable rudimentary XML syntax highlighting.
-- `--format`: when used with `--xml`, pretty-prints XML (including single-line XML) into indented lines.
+- `--format`: pretty-prints `--xml` or `--json` input into indented lines.
 - `--json`: enable rudimentary JSON syntax highlighting.
 - `--tab-width N`: set visual tab width (default: 4).
 

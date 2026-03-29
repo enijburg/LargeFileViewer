@@ -46,7 +46,7 @@ struct Args {
 
 struct Viewer {
     mmap: Mmap,
-    formatted_xml: Option<Vec<u8>>,
+    formatted_view: Option<Vec<u8>>,
     line_offsets: Vec<usize>,
     top_line: usize,
     left_col: usize,
@@ -113,10 +113,18 @@ impl Viewer {
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("Failed to memory-map file: {}", path.display()))?;
 
-        let formatted_xml =
-            (xml_syntax_highlighting && xml_formatting && !csv && !json_syntax_highlighting)
-                .then(|| format_xml_for_display(&mmap));
-        let source_bytes = formatted_xml.as_deref().unwrap_or(&mmap);
+        let formatted_view = if xml_formatting && !csv {
+            if xml_syntax_highlighting && !json_syntax_highlighting {
+                Some(format_xml_for_display(&mmap))
+            } else if json_syntax_highlighting && !xml_syntax_highlighting {
+                format_json_for_display(&mmap)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let source_bytes = formatted_view.as_deref().unwrap_or(&mmap);
         let line_offsets = Self::index_lines(source_bytes);
         let csv_column_widths = csv.then(|| Self::index_csv_column_widths(source_bytes, tab_width));
 
@@ -124,7 +132,7 @@ impl Viewer {
 
         Ok(Self {
             mmap,
-            formatted_xml,
+            formatted_view,
             line_offsets,
             top_line,
             left_col: 0,
@@ -138,7 +146,7 @@ impl Viewer {
     }
 
     fn view_bytes(&self) -> &[u8] {
-        self.formatted_xml.as_deref().unwrap_or(&self.mmap)
+        self.formatted_view.as_deref().unwrap_or(&self.mmap)
     }
 
     fn index_lines(bytes: &[u8]) -> Vec<usize> {
@@ -870,6 +878,66 @@ fn push_indented_xml_line(out: &mut Vec<u8>, depth: usize, content: &[u8]) {
     out.push(b'\n');
 }
 
+fn format_json_for_display(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(bytes.len().saturating_add(bytes.len() / 2));
+    let mut idx = 0usize;
+    let mut indent = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if in_string {
+            out.push(b);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            idx += 1;
+            continue;
+        }
+
+        match b {
+            b'"' => {
+                in_string = true;
+                out.push(b'"');
+            }
+            b'{' | b'[' => {
+                out.push(b);
+                out.push(b'\n');
+                indent = indent.saturating_add(1);
+                out.extend(std::iter::repeat_n(b' ', indent.saturating_mul(2)));
+            }
+            b'}' | b']' => {
+                out.push(b'\n');
+                indent = indent.saturating_sub(1);
+                out.extend(std::iter::repeat_n(b' ', indent.saturating_mul(2)));
+                out.push(b);
+            }
+            b',' => {
+                out.push(b',');
+                out.push(b'\n');
+                out.extend(std::iter::repeat_n(b' ', indent.saturating_mul(2)));
+            }
+            b':' => {
+                out.push(b':');
+                out.push(b' ');
+            }
+            b if b.is_ascii_whitespace() => {}
+            _ => out.push(b),
+        }
+        idx += 1;
+    }
+
+    if in_string || indent != 0 {
+        return None;
+    }
+    Some(out)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
     let mut viewer = Viewer::open(
@@ -1107,8 +1175,8 @@ fn prompt_find(viewer: &Viewer, out: &mut impl Write) -> Result<Option<String>> 
 #[cfg(test)]
 mod tests {
     use super::{
-        centered_top_line, classify_json_line, classify_xml_line, format_xml_for_display,
-        skipped_prefix_len, JsonTokenClass, Viewer, XmlTokenClass,
+        centered_top_line, classify_json_line, classify_xml_line, format_json_for_display,
+        format_xml_for_display, skipped_prefix_len, JsonTokenClass, Viewer, XmlTokenClass,
     };
     use std::{
         fs,
@@ -1283,5 +1351,19 @@ mod tests {
         let formatted = String::from_utf8(formatted).expect("formatted xml should be utf8");
         let expected = "<?xml version=\"1.0\"?>\n<root>\n  <!-- comment -->\n  <node/>\n</root>";
         assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn formats_json_into_pretty_lines() {
+        let json = br#"{"item":"Test","count":2,"ok":true,"arr":[1,2]}"#;
+        let formatted = format_json_for_display(json).expect("json should format");
+        let formatted = String::from_utf8(formatted).expect("formatted json should be utf8");
+        let expected = "{\n  \"item\": \"Test\",\n  \"count\": 2,\n  \"ok\": true,\n  \"arr\": [\n    1,\n    2\n  ]\n}";
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn invalid_json_does_not_format() {
+        assert!(format_json_for_display(br#"{"bad":"unterminated}"#).is_none());
     }
 }
