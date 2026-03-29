@@ -35,6 +35,15 @@ struct Viewer {
     tab_width: usize,
 }
 
+fn centered_top_line(target_line: usize, viewport_rows: usize, line_count: usize) -> usize {
+    if line_count == 0 {
+        return 0;
+    }
+
+    let centered = target_line.saturating_sub(viewport_rows / 2);
+    centered.min(line_count - 1)
+}
+
 impl Viewer {
     fn open(path: PathBuf, tab_width: usize) -> Result<Self> {
         let file = File::open(&path)
@@ -85,7 +94,7 @@ impl Viewer {
         )?;
 
         let status = format!(
-            "Lines: {} | Top: {} | q: quit | ↑/↓ PgUp/PgDn Home/End",
+            "Lines: {} | Top: {} | q: quit | g: goto | ↑/↓ PgUp/PgDn Home/End",
             self.line_count(),
             self.top_line + 1
         );
@@ -213,6 +222,19 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                     let page = height.saturating_sub(2) as usize;
                     match key.code {
                         KeyCode::Char('q') => break,
+                        KeyCode::Char('g') => {
+                            if let Some(line_number) = prompt_goto_line(viewer, out)? {
+                                let target_line = line_number
+                                    .saturating_sub(1)
+                                    .min(viewer.line_count().saturating_sub(1));
+                                viewer.top_line = centered_top_line(
+                                    target_line,
+                                    page.max(1),
+                                    viewer.line_count(),
+                                );
+                            }
+                            needs_redraw = true;
+                        }
                         KeyCode::Up => {
                             viewer.scroll_up(1);
                             needs_redraw = true;
@@ -251,9 +273,57 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
+fn prompt_goto_line(viewer: &Viewer, out: &mut impl Write) -> Result<Option<usize>> {
+    let mut input = String::new();
+
+    loop {
+        let (width, height) = terminal::size().context("Failed to get terminal size")?;
+        let prompt = format!(
+            "Goto line (1-{}, Enter=go, Esc=cancel): {}",
+            viewer.line_count(),
+            input
+        );
+        let clipped_prompt = clip_to_width(&prompt, width as usize);
+        let y = height.saturating_sub(1);
+
+        queue!(
+            out,
+            cursor::MoveTo(0, y),
+            terminal::Clear(ClearType::CurrentLine),
+            style::PrintStyledContent(clipped_prompt.reverse())
+        )?;
+        out.flush().context("Failed to flush terminal output")?;
+
+        match event::read().context("Failed reading terminal event")? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Enter => {
+                    if input.is_empty() {
+                        return Ok(None);
+                    }
+
+                    if let Ok(line_number) = input.parse::<usize>() {
+                        if line_number >= 1 {
+                            return Ok(Some(line_number));
+                        }
+                    }
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c) if c.is_ascii_digit() => {
+                    input.push(c);
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
-    use super::Viewer;
+    use super::{centered_top_line, Viewer};
 
     #[test]
     fn indexes_lines() {
@@ -265,5 +335,20 @@ mod tests {
     fn indexes_empty() {
         let offsets = Viewer::index_lines(b"");
         assert_eq!(offsets, vec![0]);
+    }
+
+    #[test]
+    fn centers_target_line_when_possible() {
+        assert_eq!(centered_top_line(50, 20, 200), 40);
+    }
+
+    #[test]
+    fn centers_target_line_with_small_targets() {
+        assert_eq!(centered_top_line(3, 20, 200), 0);
+    }
+
+    #[test]
+    fn centers_target_line_near_end() {
+        assert_eq!(centered_top_line(199, 20, 200), 189);
     }
 }
