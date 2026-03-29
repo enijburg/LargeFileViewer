@@ -448,6 +448,7 @@ fn classify_xml_line(bytes: &[u8]) -> Vec<XmlTokenClass> {
     let mut in_quote: Option<u8> = None;
     let mut in_comment = false;
     let mut saw_tag_name = false;
+    let mut in_tag_name = false;
     let mut idx = 0usize;
 
     while idx < bytes.len() {
@@ -462,6 +463,7 @@ fn classify_xml_line(bytes: &[u8]) -> Vec<XmlTokenClass> {
                 in_comment = false;
                 in_tag = false;
                 saw_tag_name = false;
+                in_tag_name = false;
             }
         } else if let Some(quote) = in_quote {
             classes[idx] = XmlTokenClass::AttributeValue;
@@ -474,20 +476,25 @@ fn classify_xml_line(bytes: &[u8]) -> Vec<XmlTokenClass> {
                     classes[idx] = XmlTokenClass::TagDelimiter;
                     in_tag = false;
                     saw_tag_name = false;
+                    in_tag_name = false;
                 }
                 b'"' | b'\'' => {
                     classes[idx] = XmlTokenClass::AttributeValue;
                     in_quote = Some(b);
+                    in_tag_name = false;
                 }
-                b'=' | b'/' | b'?' | b'!' => {
+                b'=' => {
                     classes[idx] = XmlTokenClass::TagDelimiter;
+                    in_tag_name = false;
                 }
                 b if b.is_ascii_whitespace() => {
                     classes[idx] = XmlTokenClass::TagDelimiter;
+                    in_tag_name = false;
                 }
-                _ if !saw_tag_name => {
+                _ if in_tag_name || !saw_tag_name => {
                     classes[idx] = XmlTokenClass::TagName;
                     saw_tag_name = true;
+                    in_tag_name = true;
                 }
                 _ => {
                     classes[idx] = XmlTokenClass::AttributeName;
@@ -502,10 +509,12 @@ fn classify_xml_line(bytes: &[u8]) -> Vec<XmlTokenClass> {
                 idx += 3;
                 in_comment = true;
                 saw_tag_name = false;
+                in_tag_name = false;
             } else {
                 classes[idx] = XmlTokenClass::TagDelimiter;
                 in_tag = true;
                 saw_tag_name = false;
+                in_tag_name = true;
             }
         } else {
             classes[idx] = XmlTokenClass::Text;
