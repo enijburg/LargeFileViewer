@@ -76,7 +76,13 @@ impl Viewer {
         let body_rows = height.saturating_sub(2) as usize;
         let width = width as usize;
 
-        queue!(out, cursor::MoveTo(0, 0), terminal::Clear(ClearType::All))?;
+        // Synchronized updates reduce perceived flicker by presenting the frame at once.
+        queue!(
+            out,
+            terminal::BeginSynchronizedUpdate,
+            cursor::MoveTo(0, 0),
+            terminal::Clear(ClearType::All)
+        )?;
 
         let status = format!(
             "Lines: {} | Top: {} | q: quit | ↑/↓ PgUp/PgDn Home/End",
@@ -109,6 +115,7 @@ impl Viewer {
             style::PrintStyledContent(clipped_footer.dark_grey())
         )?;
 
+        queue!(out, terminal::EndSynchronizedUpdate)?;
         out.flush().context("Failed to flush terminal output")?;
         Ok(())
     }
@@ -191,30 +198,51 @@ fn main() -> Result<()> {
 }
 
 fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
-    loop {
-        viewer.render(out)?;
+    let mut needs_redraw = true;
 
-        if event::poll(Duration::from_millis(200)).context("Failed polling terminal events")? {
+    loop {
+        if needs_redraw {
+            viewer.render(out)?;
+            needs_redraw = false;
+        }
+
+        if event::poll(Duration::from_millis(250)).context("Failed polling terminal events")? {
             match event::read().context("Failed reading terminal event")? {
                 Event::Key(key) if key.kind == KeyEventKind::Press => {
                     let (_, height) = terminal::size().context("Failed to get terminal size")?;
                     let page = height.saturating_sub(2) as usize;
                     match key.code {
                         KeyCode::Char('q') => break,
-                        KeyCode::Up => viewer.scroll_up(1),
-                        KeyCode::Down => viewer.scroll_down(1),
-                        KeyCode::PageUp => viewer.scroll_up(page.max(1)),
-                        KeyCode::PageDown => viewer.scroll_down(page.max(1)),
-                        KeyCode::Home => viewer.top_line = 0,
+                        KeyCode::Up => {
+                            viewer.scroll_up(1);
+                            needs_redraw = true;
+                        }
+                        KeyCode::Down => {
+                            viewer.scroll_down(1);
+                            needs_redraw = true;
+                        }
+                        KeyCode::PageUp => {
+                            viewer.scroll_up(page.max(1));
+                            needs_redraw = true;
+                        }
+                        KeyCode::PageDown => {
+                            viewer.scroll_down(page.max(1));
+                            needs_redraw = true;
+                        }
+                        KeyCode::Home => {
+                            viewer.top_line = 0;
+                            needs_redraw = true;
+                        }
                         KeyCode::End => {
                             if viewer.line_count() > 0 {
                                 viewer.top_line = viewer.line_count() - 1;
                             }
+                            needs_redraw = true;
                         }
                         _ => {}
                     }
                 }
-                Event::Resize(_, _) => {}
+                Event::Resize(_, _) => needs_redraw = true,
                 _ => {}
             }
         }
