@@ -12,7 +12,7 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind},
     execute, queue,
-    style::{self, Stylize},
+    style::{self, Color, Stylize},
     terminal::{self, ClearType},
 };
 use memmap2::Mmap;
@@ -30,6 +30,10 @@ struct Args {
     /// Render comma-separated values in aligned columns.
     #[arg(long)]
     csv: bool,
+
+    /// Enable rudimentary XML syntax highlighting.
+    #[arg(long)]
+    xml: bool,
 }
 
 struct Viewer {
@@ -39,8 +43,29 @@ struct Viewer {
     left_col: usize,
     tab_width: usize,
     csv_column_widths: Option<Vec<usize>>,
+    xml_syntax_highlighting: bool,
     search_query: Option<Vec<u8>>,
     match_range: Option<(usize, usize)>,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum XmlTokenClass {
+    Text,
+    TagDelimiter,
+    TagName,
+    AttributeName,
+    AttributeValue,
+    Comment,
+}
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+enum RenderClass {
+    Text,
+    TagDelimiter,
+    TagName,
+    AttributeName,
+    AttributeValue,
+    Comment,
 }
 
 fn centered_top_line(target_line: usize, viewport_rows: usize, line_count: usize) -> usize {
@@ -53,7 +78,12 @@ fn centered_top_line(target_line: usize, viewport_rows: usize, line_count: usize
 }
 
 impl Viewer {
-    fn open(path: PathBuf, tab_width: usize, csv: bool) -> Result<Self> {
+    fn open(
+        path: PathBuf,
+        tab_width: usize,
+        csv: bool,
+        xml_syntax_highlighting: bool,
+    ) -> Result<Self> {
         let file = File::open(&path)
             .with_context(|| format!("Failed to open file: {}", path.display()))?;
 
@@ -73,6 +103,7 @@ impl Viewer {
             left_col: 0,
             tab_width,
             csv_column_widths,
+            xml_syntax_highlighting,
             search_query: None,
             match_range: None,
         })
@@ -213,11 +244,15 @@ impl Viewer {
         });
 
         let bytes = &self.mmap[line_start..line_end];
-        let mut segments: Vec<(bool, String)> = Vec::new();
+        let content_start = skipped_prefix_len(line_idx, bytes);
+        let mut segments: Vec<(bool, RenderClass, String)> = Vec::new();
         let mut visible_width = 0usize;
         let mut absolute_col = 0usize;
+        let xml_classes = (!self.xml_syntax_highlighting || self.csv_column_widths.is_some())
+            .then(Vec::new)
+            .unwrap_or_else(|| classify_xml_line(bytes));
 
-        let mut push_char = |c: char, is_highlight: bool| {
+        let mut push_char = |c: char, is_highlight: bool, render_class: RenderClass| {
             if absolute_col < self.left_col {
                 absolute_col += 1;
                 return;
@@ -228,12 +263,12 @@ impl Viewer {
             }
             if segments
                 .last()
-                .map(|(h, _)| *h != is_highlight)
+                .map(|(h, class, _)| *h != is_highlight || *class != render_class)
                 .unwrap_or(true)
             {
-                segments.push((is_highlight, String::new()));
+                segments.push((is_highlight, render_class, String::new()));
             }
-            let (_, target) = segments.last_mut().expect("segment just pushed");
+            let (_, _, target) = segments.last_mut().expect("segment just pushed");
             target.push(c);
             visible_width += 1;
             absolute_col += 1;
@@ -243,7 +278,7 @@ impl Viewer {
             let mut column_idx = 0usize;
             let mut field_width = 0usize;
 
-            for (idx, &b) in bytes.iter().enumerate() {
+            for (idx, &b) in bytes.iter().enumerate().skip(content_start) {
                 if b == b'\n' || b == b'\r' {
                     continue;
                 }
@@ -257,31 +292,31 @@ impl Viewer {
                     b',' => {
                         let target_width = column_widths.get(column_idx).copied().unwrap_or(0);
                         for _ in field_width..target_width {
-                            push_char(' ', false);
+                            push_char(' ', false, RenderClass::Text);
                         }
-                        push_char(',', is_highlight);
-                        push_char(' ', false);
+                        push_char(',', is_highlight, RenderClass::Text);
+                        push_char(' ', false, RenderClass::Text);
                         column_idx += 1;
                         field_width = 0;
                     }
                     b'\t' => {
                         for _ in 0..self.tab_width {
-                            push_char(' ', is_highlight);
+                            push_char(' ', is_highlight, RenderClass::Text);
                             field_width += 1;
                         }
                     }
                     0x20..=0x7e => {
-                        push_char(b as char, is_highlight);
+                        push_char(b as char, is_highlight, RenderClass::Text);
                         field_width += 1;
                     }
                     _ => {
-                        push_char('·', is_highlight);
+                        push_char('·', is_highlight, RenderClass::Text);
                         field_width += 1;
                     }
                 }
             }
         } else {
-            for (idx, &b) in bytes.iter().enumerate() {
+            for (idx, &b) in bytes.iter().enumerate().skip(content_start) {
                 if b == b'\n' || b == b'\r' {
                     continue;
                 }
@@ -290,24 +325,49 @@ impl Viewer {
                 let is_highlight = highlight
                     .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
                     .unwrap_or(false);
+                let render_class =
+                    match xml_classes.get(idx).copied().unwrap_or(XmlTokenClass::Text) {
+                        XmlTokenClass::Text => RenderClass::Text,
+                        XmlTokenClass::TagDelimiter => RenderClass::TagDelimiter,
+                        XmlTokenClass::TagName => RenderClass::TagName,
+                        XmlTokenClass::AttributeName => RenderClass::AttributeName,
+                        XmlTokenClass::AttributeValue => RenderClass::AttributeValue,
+                        XmlTokenClass::Comment => RenderClass::Comment,
+                    };
 
                 match b {
                     b'\t' => {
                         for _ in 0..self.tab_width {
-                            push_char(' ', is_highlight);
+                            push_char(' ', is_highlight, render_class);
                         }
                     }
-                    0x20..=0x7e => push_char(b as char, is_highlight),
-                    _ => push_char('·', is_highlight),
+                    0x20..=0x7e => push_char(b as char, is_highlight, render_class),
+                    _ => push_char('·', is_highlight, render_class),
                 }
             }
         }
 
-        for (is_highlight, text) in segments {
+        for (is_highlight, render_class, text) in segments {
             if is_highlight {
-                queue!(out, style::PrintStyledContent(text.reverse()))?;
+                let styled = match render_class {
+                    RenderClass::Text => style::style(text).with(Color::White).reverse(),
+                    RenderClass::TagDelimiter => style::style(text).with(Color::Cyan).reverse(),
+                    RenderClass::TagName => style::style(text).with(Color::DarkYellow).reverse(),
+                    RenderClass::AttributeName => style::style(text).with(Color::Green).reverse(),
+                    RenderClass::AttributeValue => style::style(text).with(Color::Yellow).reverse(),
+                    RenderClass::Comment => style::style(text).with(Color::DarkGrey).reverse(),
+                };
+                queue!(out, style::PrintStyledContent(styled))?;
             } else {
-                queue!(out, style::Print(text))?;
+                let styled = match render_class {
+                    RenderClass::Text => style::style(text).with(Color::White),
+                    RenderClass::TagDelimiter => style::style(text).with(Color::Cyan),
+                    RenderClass::TagName => style::style(text).with(Color::DarkYellow),
+                    RenderClass::AttributeName => style::style(text).with(Color::Green),
+                    RenderClass::AttributeValue => style::style(text).with(Color::Yellow),
+                    RenderClass::Comment => style::style(text).with(Color::DarkGrey),
+                };
+                queue!(out, style::PrintStyledContent(styled))?;
             }
         }
 
@@ -383,9 +443,101 @@ fn clip_to_width(s: &str, max_width: usize) -> String {
     s.chars().take(max_width).collect()
 }
 
+fn skipped_prefix_len(line_idx: usize, bytes: &[u8]) -> usize {
+    if line_idx == 0 && bytes.starts_with(&[0xEF_u8, 0xBB_u8, 0xBF_u8]) {
+        3
+    } else {
+        0
+    }
+}
+
+fn classify_xml_line(bytes: &[u8]) -> Vec<XmlTokenClass> {
+    let mut classes = vec![XmlTokenClass::Text; bytes.len()];
+    let mut in_tag = false;
+    let mut in_quote: Option<u8> = None;
+    let mut in_comment = false;
+    let mut saw_tag_name = false;
+    let mut in_tag_name = false;
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        let b = bytes[idx];
+
+        if in_comment {
+            classes[idx] = XmlTokenClass::Comment;
+            if idx + 2 < bytes.len() && bytes[idx..=idx + 2] == *b"-->" {
+                classes[idx + 1] = XmlTokenClass::Comment;
+                classes[idx + 2] = XmlTokenClass::Comment;
+                idx += 2;
+                in_comment = false;
+                in_tag = false;
+                saw_tag_name = false;
+                in_tag_name = false;
+            }
+        } else if let Some(quote) = in_quote {
+            classes[idx] = XmlTokenClass::AttributeValue;
+            if b == quote {
+                in_quote = None;
+            }
+        } else if in_tag {
+            match b {
+                b'>' => {
+                    classes[idx] = XmlTokenClass::TagDelimiter;
+                    in_tag = false;
+                    saw_tag_name = false;
+                    in_tag_name = false;
+                }
+                b'"' | b'\'' => {
+                    classes[idx] = XmlTokenClass::AttributeValue;
+                    in_quote = Some(b);
+                    in_tag_name = false;
+                }
+                b'=' => {
+                    classes[idx] = XmlTokenClass::TagDelimiter;
+                    in_tag_name = false;
+                }
+                b if b.is_ascii_whitespace() => {
+                    classes[idx] = XmlTokenClass::TagDelimiter;
+                    in_tag_name = false;
+                }
+                _ if in_tag_name || !saw_tag_name => {
+                    classes[idx] = XmlTokenClass::TagName;
+                    saw_tag_name = true;
+                    in_tag_name = true;
+                }
+                _ => {
+                    classes[idx] = XmlTokenClass::AttributeName;
+                }
+            }
+        } else if b == b'<' {
+            if idx + 3 < bytes.len() && bytes[idx..=idx + 3] == *b"<!--" {
+                classes[idx] = XmlTokenClass::Comment;
+                classes[idx + 1] = XmlTokenClass::Comment;
+                classes[idx + 2] = XmlTokenClass::Comment;
+                classes[idx + 3] = XmlTokenClass::Comment;
+                idx += 3;
+                in_comment = true;
+                saw_tag_name = false;
+                in_tag_name = false;
+            } else {
+                classes[idx] = XmlTokenClass::TagDelimiter;
+                in_tag = true;
+                saw_tag_name = false;
+                in_tag_name = true;
+            }
+        } else {
+            classes[idx] = XmlTokenClass::Text;
+        }
+
+        idx += 1;
+    }
+
+    classes
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut viewer = Viewer::open(args.file, args.tab_width, args.csv)?;
+    let mut viewer = Viewer::open(args.file, args.tab_width, args.csv, args.xml)?;
 
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -612,7 +764,7 @@ fn prompt_find(viewer: &Viewer, out: &mut impl Write) -> Result<Option<String>> 
 
 #[cfg(test)]
 mod tests {
-    use super::{centered_top_line, Viewer};
+    use super::{centered_top_line, classify_xml_line, skipped_prefix_len, Viewer, XmlTokenClass};
     use std::{
         fs,
         path::PathBuf,
@@ -671,7 +823,7 @@ mod tests {
         let path: PathBuf =
             std::env::temp_dir().join(format!("large-file-viewer-test-{nonce}.txt"));
         fs::write(&path, bytes).expect("failed to write temp file");
-        let viewer = Viewer::open(path.clone(), 4, false).expect("failed to open viewer");
+        let viewer = Viewer::open(path.clone(), 4, false, false).expect("failed to open viewer");
         fs::remove_file(path).expect("failed to remove temp file");
         viewer
     }
@@ -703,8 +855,37 @@ mod tests {
         let path: PathBuf =
             std::env::temp_dir().join(format!("large-file-viewer-test-{nonce}.txt"));
         fs::write(&path, bytes).expect("failed to write temp file");
-        let viewer = Viewer::open(path.clone(), tab_width, csv).expect("failed to open viewer");
+        let viewer =
+            Viewer::open(path.clone(), tab_width, csv, false).expect("failed to open viewer");
         fs::remove_file(path).expect("failed to remove temp file");
         viewer
+    }
+
+    #[test]
+    fn classifies_xml_tags_and_attributes() {
+        let classes = classify_xml_line(br#"<node attr="value">text</node>"#);
+        assert_eq!(classes[0], XmlTokenClass::TagDelimiter);
+        assert_eq!(classes[1], XmlTokenClass::TagName);
+        assert_eq!(classes[6], XmlTokenClass::AttributeName);
+        assert_eq!(classes[11], XmlTokenClass::AttributeValue);
+        assert_eq!(classes[19], XmlTokenClass::Text);
+    }
+
+    #[test]
+    fn classifies_xml_comments() {
+        let classes = classify_xml_line(br#"<!-- comment --> <node/>"#);
+        assert_eq!(classes[0], XmlTokenClass::Comment);
+        assert_eq!(classes[10], XmlTokenClass::Comment);
+        assert_eq!(classes[16], XmlTokenClass::Text);
+        assert_eq!(classes[17], XmlTokenClass::TagDelimiter);
+        assert_eq!(classes[18], XmlTokenClass::TagName);
+    }
+
+    #[test]
+    fn skips_utf8_bom_prefix_on_first_line_only() {
+        let bom_prefixed = [0xEF_u8, 0xBB_u8, 0xBF_u8, b'<', b'x', b'>'];
+        assert_eq!(skipped_prefix_len(0, &bom_prefixed), 3);
+        assert_eq!(skipped_prefix_len(1, &bom_prefixed), 0);
+        assert_eq!(skipped_prefix_len(0, b"<x>"), 0);
     }
 }
