@@ -35,6 +35,10 @@ struct Args {
     #[arg(long)]
     xml: bool,
 
+    /// In XML mode, indent lines based on tag depth.
+    #[arg(long)]
+    format: bool,
+
     /// Enable rudimentary JSON syntax highlighting.
     #[arg(long)]
     json: bool,
@@ -42,6 +46,7 @@ struct Args {
 
 struct Viewer {
     mmap: Mmap,
+    formatted_view: Option<Vec<u8>>,
     line_offsets: Vec<usize>,
     top_line: usize,
     left_col: usize,
@@ -98,6 +103,7 @@ impl Viewer {
         tab_width: usize,
         csv: bool,
         xml_syntax_highlighting: bool,
+        xml_formatting: bool,
         json_syntax_highlighting: bool,
     ) -> Result<Self> {
         let file = File::open(&path)
@@ -107,13 +113,26 @@ impl Viewer {
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("Failed to memory-map file: {}", path.display()))?;
 
-        let line_offsets = Self::index_lines(&mmap);
-        let csv_column_widths = csv.then(|| Self::index_csv_column_widths(&mmap, tab_width));
+        let formatted_view = if xml_formatting && !csv {
+            if xml_syntax_highlighting && !json_syntax_highlighting {
+                Some(format_xml_for_display(&mmap))
+            } else if json_syntax_highlighting && !xml_syntax_highlighting {
+                format_json_for_display(&mmap)
+            } else {
+                None
+            }
+        } else {
+            None
+        };
+        let source_bytes = formatted_view.as_deref().unwrap_or(&mmap);
+        let line_offsets = Self::index_lines(source_bytes);
+        let csv_column_widths = csv.then(|| Self::index_csv_column_widths(source_bytes, tab_width));
 
         let top_line = if csv && line_offsets.len() > 1 { 1 } else { 0 };
 
         Ok(Self {
             mmap,
+            formatted_view,
             line_offsets,
             top_line,
             left_col: 0,
@@ -124,6 +143,10 @@ impl Viewer {
             search_query: None,
             match_range: None,
         })
+    }
+
+    fn view_bytes(&self) -> &[u8] {
+        self.formatted_view.as_deref().unwrap_or(&self.mmap)
     }
 
     fn index_lines(bytes: &[u8]) -> Vec<usize> {
@@ -247,10 +270,11 @@ impl Viewer {
 
     fn render_line(&self, out: &mut impl Write, line_idx: usize, max_width: usize) -> Result<()> {
         let line_start = self.line_offsets[line_idx];
+        let view_bytes = self.view_bytes();
         let line_end = if line_idx + 1 < self.line_offsets.len() {
             self.line_offsets[line_idx + 1]
         } else {
-            self.mmap.len()
+            view_bytes.len()
         };
         let highlight = self.match_range.and_then(|(start, end)| {
             if start < line_end && end > line_start {
@@ -260,7 +284,7 @@ impl Viewer {
             }
         });
 
-        let bytes = &self.mmap[line_start..line_end];
+        let bytes = &view_bytes[line_start..line_end];
         let content_start = skipped_prefix_len(line_idx, bytes);
         let mut segments: Vec<(bool, RenderClass, String)> = Vec::new();
         let mut visible_width = 0usize;
@@ -450,10 +474,11 @@ impl Viewer {
     }
 
     fn find_forward(&self, query: &[u8], start: usize) -> Option<(usize, usize)> {
-        if query.is_empty() || start >= self.mmap.len() {
+        let bytes = self.view_bytes();
+        if query.is_empty() || start >= bytes.len() {
             return None;
         }
-        self.mmap[start..]
+        bytes[start..]
             .windows(query.len())
             .position(|window| window == query)
             .map(|relative| {
@@ -463,14 +488,15 @@ impl Viewer {
     }
 
     fn find_backward(&self, query: &[u8], start: usize) -> Option<(usize, usize)> {
-        if query.is_empty() || self.mmap.is_empty() {
+        let bytes = self.view_bytes();
+        if query.is_empty() || bytes.is_empty() {
             return None;
         }
-        let end = min(start.saturating_add(1), self.mmap.len());
+        let end = min(start.saturating_add(1), bytes.len());
         if end < query.len() {
             return None;
         }
-        self.mmap[..end]
+        bytes[..end]
             .windows(query.len())
             .rposition(|window| window == query)
             .map(|found_start| (found_start, found_start + query.len()))
@@ -655,9 +681,273 @@ fn classify_json_line(bytes: &[u8]) -> Vec<JsonTokenClass> {
     classes
 }
 
+#[derive(Clone, Copy)]
+struct XmlDisplayToken {
+    start: usize,
+    end: usize,
+    is_tag: bool,
+    is_closing: bool,
+    is_opening: bool,
+    is_self_closing: bool,
+}
+
+fn format_xml_for_display(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len().saturating_add(bytes.len() / 4));
+    let mut tokens = Vec::new();
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        if bytes[idx].is_ascii_whitespace() {
+            idx += 1;
+            continue;
+        }
+
+        if bytes[idx] == b'<' {
+            let (token_end, is_closing, is_opening, is_self_closing) = xml_tag_bounds(bytes, idx);
+            tokens.push(XmlDisplayToken {
+                start: idx,
+                end: token_end,
+                is_tag: true,
+                is_closing,
+                is_opening,
+                is_self_closing,
+            });
+            idx = token_end;
+            continue;
+        }
+
+        let text_start = idx;
+        while idx < bytes.len() && bytes[idx] != b'<' {
+            idx += 1;
+        }
+        let (trimmed_start, trimmed_end) = trim_ascii_whitespace_range(bytes, text_start, idx);
+        if trimmed_start < trimmed_end {
+            tokens.push(XmlDisplayToken {
+                start: trimmed_start,
+                end: trimmed_end,
+                is_tag: false,
+                is_closing: false,
+                is_opening: false,
+                is_self_closing: false,
+            });
+        }
+    }
+
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let token = tokens[i];
+
+        if token.is_tag
+            && token.is_opening
+            && !token.is_self_closing
+            && i + 2 < tokens.len()
+            && !tokens[i + 1].is_tag
+            && tokens[i + 2].is_tag
+            && tokens[i + 2].is_closing
+            && matching_tag_names(bytes, token, tokens[i + 2])
+        {
+            let mut line = Vec::new();
+            line.extend_from_slice(&bytes[token.start..token.end]);
+            line.extend_from_slice(&bytes[tokens[i + 1].start..tokens[i + 1].end]);
+            line.extend_from_slice(&bytes[tokens[i + 2].start..tokens[i + 2].end]);
+            push_indented_xml_line(&mut out, depth, &line);
+            i += 3;
+            continue;
+        }
+
+        let line_depth = if token.is_closing {
+            depth.saturating_sub(1)
+        } else {
+            depth
+        };
+        push_indented_xml_line(&mut out, line_depth, &bytes[token.start..token.end]);
+
+        if token.is_closing {
+            depth = depth.saturating_sub(1);
+        } else if token.is_opening && !token.is_self_closing {
+            depth = depth.saturating_add(1);
+        }
+        i += 1;
+    }
+
+    if out.last() == Some(&b'\n') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push(b'\n');
+    }
+    out
+}
+
+fn matching_tag_names(bytes: &[u8], open: XmlDisplayToken, close: XmlDisplayToken) -> bool {
+    let open_name = extract_tag_name(bytes, open.start, open.end, false);
+    let close_name = extract_tag_name(bytes, close.start, close.end, true);
+    !open_name.is_empty() && open_name == close_name
+}
+
+fn xml_tag_bounds(bytes: &[u8], start: usize) -> (usize, bool, bool, bool) {
+    let mut idx = start + 1;
+    let is_closing = idx < bytes.len() && bytes[idx] == b'/';
+    let is_special = idx < bytes.len() && matches!(bytes[idx], b'!' | b'?');
+    let mut in_quote: Option<u8> = None;
+
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if let Some(quote) = in_quote {
+            if b == quote {
+                in_quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+        } else if b == b'>' {
+            idx += 1;
+            break;
+        }
+        idx += 1;
+    }
+
+    let mut tail = idx.saturating_sub(1);
+    if tail > start && bytes[tail] == b'>' {
+        tail -= 1;
+    }
+    while tail > start && bytes[tail].is_ascii_whitespace() {
+        tail -= 1;
+    }
+    let is_self_closing = !is_special && tail > start && bytes[tail] == b'/';
+    let is_opening = !is_special && !is_closing;
+
+    (
+        idx.min(bytes.len()),
+        is_closing,
+        is_opening,
+        is_self_closing,
+    )
+}
+
+fn extract_tag_name(bytes: &[u8], start: usize, end: usize, closing: bool) -> &[u8] {
+    if end <= start + 2 {
+        return &[];
+    }
+    let mut idx = start + 1;
+    if closing && idx < end && bytes[idx] == b'/' {
+        idx += 1;
+    }
+    while idx < end && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    let name_start = idx;
+    while idx < end
+        && !bytes[idx].is_ascii_whitespace()
+        && bytes[idx] != b'/'
+        && bytes[idx] != b'>'
+        && bytes[idx] != b'?'
+    {
+        idx += 1;
+    }
+    &bytes[name_start..idx]
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    let mut end = bytes.len();
+    while start < end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &bytes[start..end]
+}
+
+fn trim_ascii_whitespace_range(bytes: &[u8], start: usize, end: usize) -> (usize, usize) {
+    let trimmed = trim_ascii_whitespace(&bytes[start..end]);
+    if trimmed.is_empty() {
+        return (start, start);
+    }
+    let leading = bytes[start..end]
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(0);
+    (start + leading, start + leading + trimmed.len())
+}
+
+fn push_indented_xml_line(out: &mut Vec<u8>, depth: usize, content: &[u8]) {
+    out.extend(std::iter::repeat_n(b' ', depth.saturating_mul(2)));
+    out.extend_from_slice(content);
+    out.push(b'\n');
+}
+
+fn format_json_for_display(bytes: &[u8]) -> Option<Vec<u8>> {
+    let mut out = Vec::with_capacity(bytes.len().saturating_add(bytes.len() / 2));
+    let mut idx = 0usize;
+    let mut indent = 0usize;
+    let mut in_string = false;
+    let mut escaped = false;
+
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if in_string {
+            out.push(b);
+            if escaped {
+                escaped = false;
+            } else if b == b'\\' {
+                escaped = true;
+            } else if b == b'"' {
+                in_string = false;
+            }
+            idx += 1;
+            continue;
+        }
+
+        match b {
+            b'"' => {
+                in_string = true;
+                out.push(b'"');
+            }
+            b'{' | b'[' => {
+                out.push(b);
+                out.push(b'\n');
+                indent = indent.saturating_add(1);
+                out.extend(std::iter::repeat_n(b' ', indent.saturating_mul(2)));
+            }
+            b'}' | b']' => {
+                out.push(b'\n');
+                indent = indent.saturating_sub(1);
+                out.extend(std::iter::repeat_n(b' ', indent.saturating_mul(2)));
+                out.push(b);
+            }
+            b',' => {
+                out.push(b',');
+                out.push(b'\n');
+                out.extend(std::iter::repeat_n(b' ', indent.saturating_mul(2)));
+            }
+            b':' => {
+                out.push(b':');
+                out.push(b' ');
+            }
+            b if b.is_ascii_whitespace() => {}
+            _ => out.push(b),
+        }
+        idx += 1;
+    }
+
+    if in_string || indent != 0 {
+        return None;
+    }
+    Some(out)
+}
+
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut viewer = Viewer::open(args.file, args.tab_width, args.csv, args.xml, args.json)?;
+    let mut viewer = Viewer::open(
+        args.file,
+        args.tab_width,
+        args.csv,
+        args.xml,
+        args.format,
+        args.json,
+    )?;
 
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -885,8 +1175,8 @@ fn prompt_find(viewer: &Viewer, out: &mut impl Write) -> Result<Option<String>> 
 #[cfg(test)]
 mod tests {
     use super::{
-        centered_top_line, classify_json_line, classify_xml_line, skipped_prefix_len,
-        JsonTokenClass, Viewer, XmlTokenClass,
+        centered_top_line, classify_json_line, classify_xml_line, format_json_for_display,
+        format_xml_for_display, skipped_prefix_len, JsonTokenClass, Viewer, XmlTokenClass,
     };
     use std::{
         fs,
@@ -952,7 +1242,7 @@ mod tests {
 
     fn test_viewer_from_bytes(bytes: &[u8]) -> Viewer {
         with_temp_file(bytes, |path| {
-            Viewer::open(path, 4, false, false, false).expect("failed to open viewer")
+            Viewer::open(path, 4, false, false, false, false).expect("failed to open viewer")
         })
     }
 
@@ -977,7 +1267,7 @@ mod tests {
 
     fn test_viewer_with_options(bytes: &[u8], tab_width: usize, csv: bool) -> Viewer {
         with_temp_file(bytes, |path| {
-            Viewer::open(path, tab_width, csv, false, false).expect("failed to open viewer")
+            Viewer::open(path, tab_width, csv, false, false, false).expect("failed to open viewer")
         })
     }
 
@@ -1042,5 +1332,38 @@ mod tests {
         assert_eq!(classes[number_index], JsonTokenClass::Number);
         assert_eq!(classes[true_index], JsonTokenClass::Keyword);
         assert_eq!(classes[null_index], JsonTokenClass::Keyword);
+    }
+
+    #[test]
+    fn formats_single_line_xml_into_indented_lines() {
+        let xml = br#"<root><parent><child/></parent><value>text</value></root>"#;
+        let formatted = format_xml_for_display(xml);
+        let formatted = String::from_utf8(formatted).expect("formatted xml should be utf8");
+        let expected =
+            "<root>\n  <parent>\n    <child/>\n  </parent>\n  <value>text</value>\n</root>";
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn formats_xml_with_comments_and_header() {
+        let xml = br#"<?xml version="1.0"?><root><!-- comment --><node/></root>"#;
+        let formatted = format_xml_for_display(xml);
+        let formatted = String::from_utf8(formatted).expect("formatted xml should be utf8");
+        let expected = "<?xml version=\"1.0\"?>\n<root>\n  <!-- comment -->\n  <node/>\n</root>";
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn formats_json_into_pretty_lines() {
+        let json = br#"{"item":"Test","count":2,"ok":true,"arr":[1,2]}"#;
+        let formatted = format_json_for_display(json).expect("json should format");
+        let formatted = String::from_utf8(formatted).expect("formatted json should be utf8");
+        let expected = "{\n  \"item\": \"Test\",\n  \"count\": 2,\n  \"ok\": true,\n  \"arr\": [\n    1,\n    2\n  ]\n}";
+        assert_eq!(formatted, expected);
+    }
+
+    #[test]
+    fn invalid_json_does_not_format() {
+        assert!(format_json_for_display(br#"{"bad":"unterminated}"#).is_none());
     }
 }
