@@ -33,6 +33,8 @@ struct Viewer {
     line_offsets: Vec<usize>,
     top_line: usize,
     tab_width: usize,
+    search_query: Option<Vec<u8>>,
+    match_range: Option<(usize, usize)>,
 }
 
 fn centered_top_line(target_line: usize, viewport_rows: usize, line_count: usize) -> usize {
@@ -60,6 +62,8 @@ impl Viewer {
             line_offsets,
             top_line: 0,
             tab_width,
+            search_query: None,
+            match_range: None,
         })
     }
 
@@ -94,7 +98,7 @@ impl Viewer {
         )?;
 
         let status = format!(
-            "Lines: {} | Top: {} | q: quit | g: goto | ↑/↓ PgUp/PgDn Home/End",
+            "Lines: {} | Top: {} | q: quit | g: goto | f: find | n/p: next/prev | ↑/↓ PgUp/PgDn Home/End",
             self.line_count(),
             self.top_line + 1
         );
@@ -111,8 +115,8 @@ impl Viewer {
                 break;
             }
 
-            let rendered = self.line_text(line_idx, width);
-            queue!(out, style::Print(rendered), cursor::MoveToNextLine(1))?;
+            self.render_line(out, line_idx, width)?;
+            queue!(out, cursor::MoveToNextLine(1))?;
         }
 
         let footer = "Memory-mapped view (renders visible window only)";
@@ -129,19 +133,26 @@ impl Viewer {
         Ok(())
     }
 
-    fn line_text(&self, line_idx: usize, max_width: usize) -> String {
-        let start = self.line_offsets[line_idx];
-        let end = if line_idx + 1 < self.line_offsets.len() {
+    fn render_line(&self, out: &mut impl Write, line_idx: usize, max_width: usize) -> Result<()> {
+        let line_start = self.line_offsets[line_idx];
+        let line_end = if line_idx + 1 < self.line_offsets.len() {
             self.line_offsets[line_idx + 1]
         } else {
             self.mmap.len()
         };
+        let highlight = self.match_range.and_then(|(start, end)| {
+            if start < line_end && end > line_start {
+                Some((start, end))
+            } else {
+                None
+            }
+        });
 
-        let bytes = &self.mmap[start..end];
-        let mut out = String::with_capacity(min(max_width + 1, bytes.len()));
+        let bytes = &self.mmap[line_start..line_end];
+        let mut segments: Vec<(bool, String)> = Vec::new();
         let mut visible_width = 0usize;
 
-        for &b in bytes {
+        for (idx, &b) in bytes.iter().enumerate() {
             if b == b'\n' || b == b'\r' {
                 continue;
             }
@@ -149,28 +160,50 @@ impl Viewer {
                 break;
             }
 
+            let absolute_idx = line_start + idx;
+            let is_highlight = highlight
+                .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
+                .unwrap_or(false);
+
+            if segments
+                .last()
+                .map(|(h, _)| *h != is_highlight)
+                .unwrap_or(true)
+            {
+                segments.push((is_highlight, String::new()));
+            }
+            let (_, target) = segments.last_mut().expect("segment just pushed");
+
             match b {
                 b'\t' => {
                     for _ in 0..self.tab_width {
                         if visible_width >= max_width {
                             break;
                         }
-                        out.push(' ');
+                        target.push(' ');
                         visible_width += 1;
                     }
                 }
                 0x20..=0x7e => {
-                    out.push(b as char);
+                    target.push(b as char);
                     visible_width += 1;
                 }
                 _ => {
-                    out.push('·');
+                    target.push('·');
                     visible_width += 1;
                 }
             }
         }
 
-        out
+        for (is_highlight, text) in segments {
+            if is_highlight {
+                queue!(out, style::PrintStyledContent(text.reverse()))?;
+            } else {
+                queue!(out, style::Print(text))?;
+            }
+        }
+
+        Ok(())
     }
 
     fn scroll_up(&mut self, by: usize) {
@@ -183,6 +216,49 @@ impl Viewer {
             return;
         }
         self.top_line = min(self.top_line + by, self.line_count() - 1);
+    }
+
+    fn line_of_offset(&self, offset: usize) -> usize {
+        if self.line_offsets.is_empty() {
+            return 0;
+        }
+        match self.line_offsets.binary_search(&offset) {
+            Ok(idx) => idx,
+            Err(insert) => insert.saturating_sub(1),
+        }
+    }
+
+    fn set_match(&mut self, start: usize, end: usize, viewport_rows: usize) {
+        self.match_range = Some((start, end));
+        let line = self.line_of_offset(start);
+        self.top_line = centered_top_line(line, viewport_rows.max(1), self.line_count());
+    }
+
+    fn find_forward(&self, query: &[u8], start: usize) -> Option<(usize, usize)> {
+        if query.is_empty() || start >= self.mmap.len() {
+            return None;
+        }
+        self.mmap[start..]
+            .windows(query.len())
+            .position(|window| window == query)
+            .map(|relative| {
+                let found_start = start + relative;
+                (found_start, found_start + query.len())
+            })
+    }
+
+    fn find_backward(&self, query: &[u8], start: usize) -> Option<(usize, usize)> {
+        if query.is_empty() || self.mmap.is_empty() {
+            return None;
+        }
+        let end = min(start.saturating_add(1), self.mmap.len());
+        if end < query.len() {
+            return None;
+        }
+        self.mmap[..end]
+            .windows(query.len())
+            .rposition(|window| window == query)
+            .map(|found_start| (found_start, found_start + query.len()))
     }
 }
 
@@ -234,6 +310,49 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                                 );
                             }
                             needs_redraw = true;
+                        }
+                        KeyCode::Char('f') => {
+                            if let Some(query) = prompt_find(viewer, out)? {
+                                let start = viewer.line_offsets[viewer.top_line];
+                                if let Some((found_start, found_end)) =
+                                    viewer.find_forward(query.as_bytes(), start)
+                                {
+                                    viewer.search_query = Some(query.into_bytes());
+                                    viewer.set_match(found_start, found_end, page.max(1));
+                                } else {
+                                    viewer.search_query = Some(query.into_bytes());
+                                    viewer.match_range = None;
+                                }
+                            }
+                            needs_redraw = true;
+                        }
+                        KeyCode::Char('n') => {
+                            if let Some(query) = &viewer.search_query {
+                                let start = viewer
+                                    .match_range
+                                    .map(|(_, end)| end)
+                                    .unwrap_or_else(|| viewer.line_offsets[viewer.top_line]);
+                                if let Some((found_start, found_end)) =
+                                    viewer.find_forward(query, start)
+                                {
+                                    viewer.set_match(found_start, found_end, page.max(1));
+                                }
+                                needs_redraw = true;
+                            }
+                        }
+                        KeyCode::Char('p') => {
+                            if let Some(query) = &viewer.search_query {
+                                let start = viewer
+                                    .match_range
+                                    .map(|(start, _)| start.saturating_sub(1))
+                                    .unwrap_or_else(|| viewer.line_offsets[viewer.top_line]);
+                                if let Some((found_start, found_end)) =
+                                    viewer.find_backward(query, start)
+                                {
+                                    viewer.set_match(found_start, found_end, page.max(1));
+                                }
+                                needs_redraw = true;
+                            }
                         }
                         KeyCode::Up => {
                             viewer.scroll_up(1);
@@ -321,9 +440,59 @@ fn prompt_goto_line(viewer: &Viewer, out: &mut impl Write) -> Result<Option<usiz
     }
 }
 
+fn prompt_find(viewer: &Viewer, out: &mut impl Write) -> Result<Option<String>> {
+    let mut input = viewer
+        .search_query
+        .as_ref()
+        .map(|query| String::from_utf8_lossy(query).to_string())
+        .unwrap_or_default();
+
+    loop {
+        let (width, height) = terminal::size().context("Failed to get terminal size")?;
+        let prompt = format!("Find text (Enter=find, Esc=cancel): {}", input);
+        let clipped_prompt = clip_to_width(&prompt, width as usize);
+        let y = height.saturating_sub(1);
+
+        queue!(
+            out,
+            cursor::MoveTo(0, y),
+            terminal::Clear(ClearType::CurrentLine),
+            style::PrintStyledContent(clipped_prompt.reverse())
+        )?;
+        out.flush().context("Failed to flush terminal output")?;
+
+        match event::read().context("Failed reading terminal event")? {
+            Event::Key(key) if key.kind == KeyEventKind::Press => match key.code {
+                KeyCode::Esc => return Ok(None),
+                KeyCode::Enter => {
+                    if input.is_empty() {
+                        return Ok(None);
+                    }
+                    return Ok(Some(input));
+                }
+                KeyCode::Backspace => {
+                    input.pop();
+                }
+                KeyCode::Char(c) => {
+                    if !c.is_control() {
+                        input.push(c);
+                    }
+                }
+                _ => {}
+            },
+            _ => {}
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::{centered_top_line, Viewer};
+    use std::{
+        fs,
+        path::PathBuf,
+        time::{SystemTime, UNIX_EPOCH},
+    };
 
     #[test]
     fn indexes_lines() {
@@ -350,5 +519,35 @@ mod tests {
     #[test]
     fn centers_target_line_near_end() {
         assert_eq!(centered_top_line(199, 20, 200), 189);
+    }
+
+    #[test]
+    fn finds_forward_and_backward() {
+        let viewer = test_viewer_from_bytes(b"abc\ndef abc xyz abc");
+        assert_eq!(viewer.find_forward(b"abc", 0), Some((0, 3)));
+        assert_eq!(viewer.find_forward(b"abc", 4), Some((8, 11)));
+        assert_eq!(viewer.find_backward(b"abc", 18), Some((16, 19)));
+        assert_eq!(viewer.find_backward(b"missing", 18), None);
+    }
+
+    #[test]
+    fn maps_offsets_to_lines() {
+        let viewer = test_viewer_from_bytes(b"line1\nline2\nline3");
+        assert_eq!(viewer.line_of_offset(0), 0);
+        assert_eq!(viewer.line_of_offset(6), 1);
+        assert_eq!(viewer.line_of_offset(12), 2);
+    }
+
+    fn test_viewer_from_bytes(bytes: &[u8]) -> Viewer {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let path: PathBuf =
+            std::env::temp_dir().join(format!("large-file-viewer-test-{nonce}.txt"));
+        fs::write(&path, bytes).expect("failed to write temp file");
+        let viewer = Viewer::open(path.clone(), 4).expect("failed to open viewer");
+        fs::remove_file(path).expect("failed to remove temp file");
+        viewer
     }
 }
