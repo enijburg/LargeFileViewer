@@ -19,7 +19,7 @@ cargo build --release --target x86_64-pc-windows-msvc
 
 If you are already on Windows x64 with Rust MSVC toolchain installed, this generates:
 
-`target/x86_64-pc-windows-msvc/release/large_file_viewer.exe`
+`target/x86_64-pc-windows-msvc/release/lfv.exe`
 
 ## Run
 
