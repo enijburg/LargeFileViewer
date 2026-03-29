@@ -26,6 +26,10 @@ struct Args {
     /// Number of spaces a tab represents when rendering.
     #[arg(long, default_value_t = 4)]
     tab_width: usize,
+
+    /// Render comma-separated values in aligned columns.
+    #[arg(long)]
+    csv: bool,
 }
 
 struct Viewer {
@@ -33,6 +37,7 @@ struct Viewer {
     line_offsets: Vec<usize>,
     top_line: usize,
     tab_width: usize,
+    csv_column_widths: Option<Vec<usize>>,
     search_query: Option<Vec<u8>>,
     match_range: Option<(usize, usize)>,
 }
@@ -47,7 +52,7 @@ fn centered_top_line(target_line: usize, viewport_rows: usize, line_count: usize
 }
 
 impl Viewer {
-    fn open(path: PathBuf, tab_width: usize) -> Result<Self> {
+    fn open(path: PathBuf, tab_width: usize, csv: bool) -> Result<Self> {
         let file = File::open(&path)
             .with_context(|| format!("Failed to open file: {}", path.display()))?;
 
@@ -56,12 +61,14 @@ impl Viewer {
             .with_context(|| format!("Failed to memory-map file: {}", path.display()))?;
 
         let line_offsets = Self::index_lines(&mmap);
+        let csv_column_widths = csv.then(|| Self::index_csv_column_widths(&mmap, tab_width));
 
         Ok(Self {
             mmap,
             line_offsets,
             top_line: 0,
             tab_width,
+            csv_column_widths,
             search_query: None,
             match_range: None,
         })
@@ -82,6 +89,42 @@ impl Viewer {
 
     fn line_count(&self) -> usize {
         self.line_offsets.len()
+    }
+
+    fn index_csv_column_widths(bytes: &[u8], tab_width: usize) -> Vec<usize> {
+        let mut widths: Vec<usize> = Vec::new();
+        let mut column = 0usize;
+        let mut current_width = 0usize;
+
+        for &b in bytes {
+            match b {
+                b'\n' => {
+                    if widths.len() <= column {
+                        widths.resize(column + 1, 0);
+                    }
+                    widths[column] = widths[column].max(current_width);
+                    column = 0;
+                    current_width = 0;
+                }
+                b'\r' => {}
+                b',' => {
+                    if widths.len() <= column {
+                        widths.resize(column + 1, 0);
+                    }
+                    widths[column] = widths[column].max(current_width);
+                    column += 1;
+                    current_width = 0;
+                }
+                b'\t' => current_width += tab_width,
+                _ => current_width += 1,
+            }
+        }
+
+        if widths.len() <= column {
+            widths.resize(column + 1, 0);
+        }
+        widths[column] = widths[column].max(current_width);
+        widths
     }
 
     fn render(&self, out: &mut impl Write) -> Result<()> {
@@ -152,19 +195,10 @@ impl Viewer {
         let mut segments: Vec<(bool, String)> = Vec::new();
         let mut visible_width = 0usize;
 
-        for (idx, &b) in bytes.iter().enumerate() {
-            if b == b'\n' || b == b'\r' {
-                continue;
-            }
+        let mut push_char = |c: char, is_highlight: bool| {
             if visible_width >= max_width {
-                break;
+                return;
             }
-
-            let absolute_idx = line_start + idx;
-            let is_highlight = highlight
-                .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
-                .unwrap_or(false);
-
             if segments
                 .last()
                 .map(|(h, _)| *h != is_highlight)
@@ -173,24 +207,70 @@ impl Viewer {
                 segments.push((is_highlight, String::new()));
             }
             let (_, target) = segments.last_mut().expect("segment just pushed");
+            target.push(c);
+            visible_width += 1;
+        };
 
-            match b {
-                b'\t' => {
-                    for _ in 0..self.tab_width {
-                        if visible_width >= max_width {
-                            break;
+        if let Some(column_widths) = &self.csv_column_widths {
+            let mut column_idx = 0usize;
+            let mut field_width = 0usize;
+
+            for (idx, &b) in bytes.iter().enumerate() {
+                if b == b'\n' || b == b'\r' {
+                    continue;
+                }
+
+                let absolute_idx = line_start + idx;
+                let is_highlight = highlight
+                    .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
+                    .unwrap_or(false);
+
+                match b {
+                    b',' => {
+                        let target_width = column_widths.get(column_idx).copied().unwrap_or(0);
+                        for _ in field_width..target_width {
+                            push_char(' ', false);
                         }
-                        target.push(' ');
-                        visible_width += 1;
+                        push_char(',', is_highlight);
+                        push_char(' ', false);
+                        column_idx += 1;
+                        field_width = 0;
+                    }
+                    b'\t' => {
+                        for _ in 0..self.tab_width {
+                            push_char(' ', is_highlight);
+                            field_width += 1;
+                        }
+                    }
+                    0x20..=0x7e => {
+                        push_char(b as char, is_highlight);
+                        field_width += 1;
+                    }
+                    _ => {
+                        push_char('·', is_highlight);
+                        field_width += 1;
                     }
                 }
-                0x20..=0x7e => {
-                    target.push(b as char);
-                    visible_width += 1;
+            }
+        } else {
+            for (idx, &b) in bytes.iter().enumerate() {
+                if b == b'\n' || b == b'\r' {
+                    continue;
                 }
-                _ => {
-                    target.push('·');
-                    visible_width += 1;
+
+                let absolute_idx = line_start + idx;
+                let is_highlight = highlight
+                    .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
+                    .unwrap_or(false);
+
+                match b {
+                    b'\t' => {
+                        for _ in 0..self.tab_width {
+                            push_char(' ', is_highlight);
+                        }
+                    }
+                    0x20..=0x7e => push_char(b as char, is_highlight),
+                    _ => push_char('·', is_highlight),
                 }
             }
         }
@@ -268,7 +348,7 @@ fn clip_to_width(s: &str, max_width: usize) -> String {
 
 fn main() -> Result<()> {
     let args = Args::parse();
-    let mut viewer = Viewer::open(args.file, args.tab_width)?;
+    let mut viewer = Viewer::open(args.file, args.tab_width, args.csv)?;
 
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = io::stdout();
@@ -546,8 +626,14 @@ mod tests {
         let path: PathBuf =
             std::env::temp_dir().join(format!("large-file-viewer-test-{nonce}.txt"));
         fs::write(&path, bytes).expect("failed to write temp file");
-        let viewer = Viewer::open(path.clone(), 4).expect("failed to open viewer");
+        let viewer = Viewer::open(path.clone(), 4, false).expect("failed to open viewer");
         fs::remove_file(path).expect("failed to remove temp file");
         viewer
+    }
+
+    #[test]
+    fn indexes_csv_column_widths() {
+        let widths = Viewer::index_csv_column_widths(b"a,bbb\ncccc,d", 4);
+        assert_eq!(widths, vec![4, 3]);
     }
 }
