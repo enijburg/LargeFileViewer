@@ -36,6 +36,7 @@ struct Viewer {
     mmap: Mmap,
     line_offsets: Vec<usize>,
     top_line: usize,
+    left_col: usize,
     tab_width: usize,
     csv_column_widths: Option<Vec<usize>>,
     search_query: Option<Vec<u8>>,
@@ -67,6 +68,7 @@ impl Viewer {
             mmap,
             line_offsets,
             top_line: 0,
+            left_col: 0,
             tab_width,
             csv_column_widths,
             search_query: None,
@@ -141,9 +143,10 @@ impl Viewer {
         )?;
 
         let status = format!(
-            "Lines: {} | Top: {} | q: quit | g: goto | f: find | n/p: next/prev | ↑/↓ PgUp/PgDn Home/End",
+            "Lines: {} | Top: {} | Left: {} | q: quit | g: goto | f: find | n/p: next/prev | ←/→ ↑/↓ PgUp/PgDn Home/End",
             self.line_count(),
-            self.top_line + 1
+            self.top_line + 1,
+            self.left_col + 1
         );
         let clipped_status = clip_to_width(&status, width);
         queue!(
@@ -194,9 +197,15 @@ impl Viewer {
         let bytes = &self.mmap[line_start..line_end];
         let mut segments: Vec<(bool, String)> = Vec::new();
         let mut visible_width = 0usize;
+        let mut absolute_col = 0usize;
 
         let mut push_char = |c: char, is_highlight: bool| {
+            if absolute_col < self.left_col {
+                absolute_col += 1;
+                return;
+            }
             if visible_width >= max_width {
+                absolute_col += 1;
                 return;
             }
             if segments
@@ -209,6 +218,7 @@ impl Viewer {
             let (_, target) = segments.last_mut().expect("segment just pushed");
             target.push(c);
             visible_width += 1;
+            absolute_col += 1;
         };
 
         if let Some(column_widths) = &self.csv_column_widths {
@@ -296,6 +306,14 @@ impl Viewer {
             return;
         }
         self.top_line = min(self.top_line + by, self.line_count() - 1);
+    }
+
+    fn scroll_left(&mut self, by: usize) {
+        self.left_col = self.left_col.saturating_sub(by);
+    }
+
+    fn scroll_right(&mut self, by: usize) {
+        self.left_col = self.left_col.saturating_add(by);
     }
 
     fn line_of_offset(&self, offset: usize) -> usize {
@@ -433,6 +451,14 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                                 }
                                 needs_redraw = true;
                             }
+                        }
+                        KeyCode::Left => {
+                            viewer.scroll_left(1);
+                            needs_redraw = true;
+                        }
+                        KeyCode::Right => {
+                            viewer.scroll_right(1);
+                            needs_redraw = true;
                         }
                         KeyCode::Up => {
                             viewer.scroll_up(1);
