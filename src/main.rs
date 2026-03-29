@@ -133,50 +133,6 @@ impl Viewer {
         Ok(())
     }
 
-    fn line_text(&self, line_idx: usize, max_width: usize) -> String {
-        let start = self.line_offsets[line_idx];
-        let end = if line_idx + 1 < self.line_offsets.len() {
-            self.line_offsets[line_idx + 1]
-        } else {
-            self.mmap.len()
-        };
-
-        let bytes = &self.mmap[start..end];
-        let mut out = String::with_capacity(min(max_width + 1, bytes.len()));
-        let mut visible_width = 0usize;
-
-        for &b in bytes {
-            if b == b'\n' || b == b'\r' {
-                continue;
-            }
-            if visible_width >= max_width {
-                break;
-            }
-
-            match b {
-                b'\t' => {
-                    for _ in 0..self.tab_width {
-                        if visible_width >= max_width {
-                            break;
-                        }
-                        out.push(' ');
-                        visible_width += 1;
-                    }
-                }
-                0x20..=0x7e => {
-                    out.push(b as char);
-                    visible_width += 1;
-                }
-                _ => {
-                    out.push('·');
-                    visible_width += 1;
-                }
-            }
-        }
-
-        out
-    }
-
     fn render_line(&self, out: &mut impl Write, line_idx: usize, max_width: usize) -> Result<()> {
         let line_start = self.line_offsets[line_idx];
         let line_end = if line_idx + 1 < self.line_offsets.len() {
