@@ -46,13 +46,13 @@ struct Args {
 
 struct Viewer {
     mmap: Mmap,
+    formatted_xml: Option<Vec<u8>>,
     line_offsets: Vec<usize>,
     top_line: usize,
     left_col: usize,
     tab_width: usize,
     csv_column_widths: Option<Vec<usize>>,
     xml_syntax_highlighting: bool,
-    xml_line_indentation: Option<Vec<usize>>,
     json_syntax_highlighting: bool,
     search_query: Option<Vec<u8>>,
     match_range: Option<(usize, usize)>,
@@ -113,27 +113,32 @@ impl Viewer {
         let mmap = unsafe { Mmap::map(&file) }
             .with_context(|| format!("Failed to memory-map file: {}", path.display()))?;
 
-        let line_offsets = Self::index_lines(&mmap);
-        let csv_column_widths = csv.then(|| Self::index_csv_column_widths(&mmap, tab_width));
-        let xml_line_indentation =
+        let formatted_xml =
             (xml_syntax_highlighting && xml_formatting && !csv && !json_syntax_highlighting)
-                .then(|| Self::index_xml_line_indentation(&mmap, &line_offsets));
+                .then(|| format_xml_for_display(&mmap));
+        let source_bytes = formatted_xml.as_deref().unwrap_or(&mmap);
+        let line_offsets = Self::index_lines(source_bytes);
+        let csv_column_widths = csv.then(|| Self::index_csv_column_widths(source_bytes, tab_width));
 
         let top_line = if csv && line_offsets.len() > 1 { 1 } else { 0 };
 
         Ok(Self {
             mmap,
+            formatted_xml,
             line_offsets,
             top_line,
             left_col: 0,
             tab_width,
             csv_column_widths,
             xml_syntax_highlighting,
-            xml_line_indentation,
             json_syntax_highlighting,
             search_query: None,
             match_range: None,
         })
+    }
+
+    fn view_bytes(&self) -> &[u8] {
+        self.formatted_xml.as_deref().unwrap_or(&self.mmap)
     }
 
     fn index_lines(bytes: &[u8]) -> Vec<usize> {
@@ -187,36 +192,6 @@ impl Viewer {
         }
         widths[column] = widths[column].max(current_width);
         widths
-    }
-
-    fn index_xml_line_indentation(bytes: &[u8], line_offsets: &[usize]) -> Vec<usize> {
-        let mut indentation = vec![0usize; line_offsets.len()];
-        let mut depth = 0usize;
-
-        for (line_idx, &line_start) in line_offsets.iter().enumerate() {
-            let line_end = if line_idx + 1 < line_offsets.len() {
-                line_offsets[line_idx + 1]
-            } else {
-                bytes.len()
-            };
-            let line = &bytes[line_start..line_end];
-            let (starts_with_closing_tag, net_delta) = analyze_xml_line_indentation(line);
-
-            let this_line_depth = if starts_with_closing_tag {
-                depth.saturating_sub(1)
-            } else {
-                depth
-            };
-            indentation[line_idx] = this_line_depth;
-
-            if net_delta.is_negative() {
-                depth = depth.saturating_sub(net_delta.unsigned_abs());
-            } else {
-                depth = depth.saturating_add(net_delta as usize);
-            }
-        }
-
-        indentation
     }
 
     fn render(&self, out: &mut impl Write) -> Result<()> {
@@ -287,10 +262,11 @@ impl Viewer {
 
     fn render_line(&self, out: &mut impl Write, line_idx: usize, max_width: usize) -> Result<()> {
         let line_start = self.line_offsets[line_idx];
+        let view_bytes = self.view_bytes();
         let line_end = if line_idx + 1 < self.line_offsets.len() {
             self.line_offsets[line_idx + 1]
         } else {
-            self.mmap.len()
+            view_bytes.len()
         };
         let highlight = self.match_range.and_then(|(start, end)| {
             if start < line_end && end > line_start {
@@ -300,7 +276,7 @@ impl Viewer {
             }
         });
 
-        let bytes = &self.mmap[line_start..line_end];
+        let bytes = &view_bytes[line_start..line_end];
         let content_start = skipped_prefix_len(line_idx, bytes);
         let mut segments: Vec<(bool, RenderClass, String)> = Vec::new();
         let mut visible_width = 0usize;
@@ -380,13 +356,6 @@ impl Viewer {
                 }
             }
         } else {
-            if let Some(indentation) = &self.xml_line_indentation {
-                let indent_spaces = indentation.get(line_idx).copied().unwrap_or(0) * 2;
-                for _ in 0..indent_spaces {
-                    push_char(' ', false, RenderClass::Text);
-                }
-            }
-
             for (idx, &b) in bytes.iter().enumerate().skip(content_start) {
                 if b == b'\n' || b == b'\r' {
                     continue;
@@ -497,10 +466,11 @@ impl Viewer {
     }
 
     fn find_forward(&self, query: &[u8], start: usize) -> Option<(usize, usize)> {
-        if query.is_empty() || start >= self.mmap.len() {
+        let bytes = self.view_bytes();
+        if query.is_empty() || start >= bytes.len() {
             return None;
         }
-        self.mmap[start..]
+        bytes[start..]
             .windows(query.len())
             .position(|window| window == query)
             .map(|relative| {
@@ -510,14 +480,15 @@ impl Viewer {
     }
 
     fn find_backward(&self, query: &[u8], start: usize) -> Option<(usize, usize)> {
-        if query.is_empty() || self.mmap.is_empty() {
+        let bytes = self.view_bytes();
+        if query.is_empty() || bytes.is_empty() {
             return None;
         }
-        let end = min(start.saturating_add(1), self.mmap.len());
+        let end = min(start.saturating_add(1), bytes.len());
         if end < query.len() {
             return None;
         }
-        self.mmap[..end]
+        bytes[..end]
             .windows(query.len())
             .rposition(|window| window == query)
             .map(|found_start| (found_start, found_start + query.len()))
@@ -702,98 +673,108 @@ fn classify_json_line(bytes: &[u8]) -> Vec<JsonTokenClass> {
     classes
 }
 
-fn analyze_xml_line_indentation(line: &[u8]) -> (bool, isize) {
-    let mut starts_with_closing_tag = false;
-    let mut in_comment = false;
-    let mut idx = skipped_prefix_len(0, line);
-    while idx < line.len() {
-        if line[idx].is_ascii_whitespace() {
+fn format_xml_for_display(bytes: &[u8]) -> Vec<u8> {
+    let mut out = Vec::with_capacity(bytes.len().saturating_add(bytes.len() / 4));
+    let mut depth = 0usize;
+    let mut idx = 0usize;
+
+    while idx < bytes.len() {
+        if bytes[idx].is_ascii_whitespace() {
             idx += 1;
             continue;
         }
-        if idx + 3 < line.len() && line[idx..].starts_with(b"<!--") {
-            in_comment = true;
-            break;
-        }
-        if line[idx] == b'<' {
-            starts_with_closing_tag = idx + 1 < line.len() && line[idx + 1] == b'/';
-        }
-        break;
-    }
 
-    let mut delta = 0isize;
-    let mut pos = 0usize;
-    while pos < line.len() {
-        if in_comment {
-            if pos + 2 < line.len() && line[pos..].starts_with(b"-->") {
-                pos += 3;
-                in_comment = false;
+        if bytes[idx] == b'<' {
+            let (token_end, is_closing, is_opening, is_self_closing) = xml_tag_bounds(bytes, idx);
+            let line_depth = if is_closing {
+                depth.saturating_sub(1)
             } else {
-                pos += 1;
+                depth
+            };
+            push_indented_xml_line(&mut out, line_depth, &bytes[idx..token_end]);
+            if is_closing {
+                depth = depth.saturating_sub(1);
+            } else if is_opening && !is_self_closing {
+                depth = depth.saturating_add(1);
             }
+            idx = token_end;
             continue;
         }
 
-        if pos + 3 < line.len() && line[pos..].starts_with(b"<!--") {
-            in_comment = true;
-            pos += 4;
-            continue;
+        let text_start = idx;
+        while idx < bytes.len() && bytes[idx] != b'<' {
+            idx += 1;
         }
-
-        if line[pos] != b'<' {
-            pos += 1;
-            continue;
+        let text = trim_ascii_whitespace(&bytes[text_start..idx]);
+        if !text.is_empty() {
+            push_indented_xml_line(&mut out, depth, text);
         }
-
-        if pos + 1 >= line.len() {
-            break;
-        }
-
-        if line[pos + 1] == b'/' {
-            delta -= 1;
-            pos += 2;
-            continue;
-        }
-
-        if matches!(line[pos + 1], b'!' | b'?') {
-            pos += 2;
-            continue;
-        }
-
-        let mut tag_end = pos + 1;
-        let mut in_quote: Option<u8> = None;
-        while tag_end < line.len() {
-            let b = line[tag_end];
-            if let Some(quote) = in_quote {
-                if b == quote {
-                    in_quote = None;
-                }
-            } else if b == b'"' || b == b'\'' {
-                in_quote = Some(b);
-            } else if b == b'>' {
-                break;
-            }
-            tag_end += 1;
-        }
-
-        if tag_end >= line.len() {
-            break;
-        }
-
-        let mut tail = tag_end;
-        while tail > pos && line[tail - 1].is_ascii_whitespace() {
-            tail -= 1;
-        }
-        let self_closing = tail > pos && line[tail - 1] == b'/';
-
-        if !self_closing {
-            delta += 1;
-        }
-
-        pos = tag_end + 1;
     }
 
-    (starts_with_closing_tag, delta)
+    if out.last() == Some(&b'\n') {
+        out.pop();
+    }
+    if out.is_empty() {
+        out.push(b'\n');
+    }
+    out
+}
+
+fn xml_tag_bounds(bytes: &[u8], start: usize) -> (usize, bool, bool, bool) {
+    let mut idx = start + 1;
+    let is_closing = idx < bytes.len() && bytes[idx] == b'/';
+    let is_special = idx < bytes.len() && matches!(bytes[idx], b'!' | b'?');
+    let mut in_quote: Option<u8> = None;
+
+    while idx < bytes.len() {
+        let b = bytes[idx];
+        if let Some(quote) = in_quote {
+            if b == quote {
+                in_quote = None;
+            }
+        } else if b == b'"' || b == b'\'' {
+            in_quote = Some(b);
+        } else if b == b'>' {
+            idx += 1;
+            break;
+        }
+        idx += 1;
+    }
+
+    let mut tail = idx.saturating_sub(1);
+    if tail > start && bytes[tail] == b'>' {
+        tail -= 1;
+    }
+    while tail > start && bytes[tail].is_ascii_whitespace() {
+        tail -= 1;
+    }
+    let is_self_closing = !is_special && tail > start && bytes[tail] == b'/';
+    let is_opening = !is_special && !is_closing;
+
+    (
+        idx.min(bytes.len()),
+        is_closing,
+        is_opening,
+        is_self_closing,
+    )
+}
+
+fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
+    let mut start = 0usize;
+    let mut end = bytes.len();
+    while start < end && bytes[start].is_ascii_whitespace() {
+        start += 1;
+    }
+    while end > start && bytes[end - 1].is_ascii_whitespace() {
+        end -= 1;
+    }
+    &bytes[start..end]
+}
+
+fn push_indented_xml_line(out: &mut Vec<u8>, depth: usize, content: &[u8]) {
+    out.extend(std::iter::repeat_n(b' ', depth.saturating_mul(2)));
+    out.extend_from_slice(content);
+    out.push(b'\n');
 }
 
 fn main() -> Result<()> {
@@ -1033,7 +1014,7 @@ fn prompt_find(viewer: &Viewer, out: &mut impl Write) -> Result<Option<String>> 
 #[cfg(test)]
 mod tests {
     use super::{
-        analyze_xml_line_indentation, centered_top_line, classify_json_line, classify_xml_line,
+        centered_top_line, classify_json_line, classify_xml_line, format_xml_for_display,
         skipped_prefix_len, JsonTokenClass, Viewer, XmlTokenClass,
     };
     use std::{
@@ -1193,25 +1174,20 @@ mod tests {
     }
 
     #[test]
-    fn tracks_xml_indentation_depth_by_line() {
-        let xml = br#"<root>
-<parent>
-<child/>
-</parent>
-</root>"#;
-        let offsets = Viewer::index_lines(xml);
-        let indentation = Viewer::index_xml_line_indentation(xml, &offsets);
-        assert_eq!(indentation, vec![0, 1, 2, 1, 0]);
+    fn formats_single_line_xml_into_indented_lines() {
+        let xml = br#"<root><parent><child/></parent><value>text</value></root>"#;
+        let formatted = format_xml_for_display(xml);
+        let formatted = String::from_utf8(formatted).expect("formatted xml should be utf8");
+        let expected = "<root>\n  <parent>\n    <child/>\n  </parent>\n  <value>\n    text\n  </value>\n</root>";
+        assert_eq!(formatted, expected);
     }
 
     #[test]
-    fn analyzes_xml_indentation_for_closing_tag_and_self_closing_tag() {
-        let (starts_closing, delta) = analyze_xml_line_indentation(br#"  </node>"#);
-        assert!(starts_closing);
-        assert_eq!(delta, -1);
-
-        let (starts_closing, delta) = analyze_xml_line_indentation(br#"  <node attr="x"/>"#);
-        assert!(!starts_closing);
-        assert_eq!(delta, 0);
+    fn formats_xml_with_comments_and_header() {
+        let xml = br#"<?xml version="1.0"?><root><!-- comment --><node/></root>"#;
+        let formatted = format_xml_for_display(xml);
+        let formatted = String::from_utf8(formatted).expect("formatted xml should be utf8");
+        let expected = "<?xml version=\"1.0\"?>\n<root>\n  <!-- comment -->\n  <node/>\n</root>";
+        assert_eq!(formatted, expected);
     }
 }
