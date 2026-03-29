@@ -64,10 +64,12 @@ impl Viewer {
         let line_offsets = Self::index_lines(&mmap);
         let csv_column_widths = csv.then(|| Self::index_csv_column_widths(&mmap, tab_width));
 
+        let top_line = if csv && line_offsets.len() > 1 { 1 } else { 0 };
+
         Ok(Self {
             mmap,
             line_offsets,
-            top_line: 0,
+            top_line,
             left_col: 0,
             tab_width,
             csv_column_widths,
@@ -155,14 +157,30 @@ impl Viewer {
             cursor::MoveToNextLine(1)
         )?;
 
-        for row in 0..body_rows {
-            let line_idx = self.top_line + row;
-            if line_idx >= self.line_count() {
-                break;
-            }
-
-            self.render_line(out, line_idx, width)?;
+        if self.csv_column_widths.is_some() && self.line_count() > 0 {
+            self.render_line(out, 0, width)?;
             queue!(out, cursor::MoveToNextLine(1))?;
+
+            let start = self.top_line.max(1);
+            for row in 1..body_rows {
+                let line_idx = start + (row - 1);
+                if line_idx >= self.line_count() {
+                    break;
+                }
+
+                self.render_line(out, line_idx, width)?;
+                queue!(out, cursor::MoveToNextLine(1))?;
+            }
+        } else {
+            for row in 0..body_rows {
+                let line_idx = self.top_line + row;
+                if line_idx >= self.line_count() {
+                    break;
+                }
+
+                self.render_line(out, line_idx, width)?;
+                queue!(out, cursor::MoveToNextLine(1))?;
+            }
         }
 
         let footer = "Memory-mapped view (renders visible window only)";
@@ -297,7 +315,8 @@ impl Viewer {
     }
 
     fn scroll_up(&mut self, by: usize) {
-        self.top_line = self.top_line.saturating_sub(by);
+        let min_top = usize::from(self.csv_column_widths.is_some() && self.line_count() > 1);
+        self.top_line = self.top_line.saturating_sub(by).max(min_top);
     }
 
     fn scroll_down(&mut self, by: usize) {
@@ -661,5 +680,31 @@ mod tests {
     fn indexes_csv_column_widths() {
         let widths = Viewer::index_csv_column_widths(b"a,bbb\ncccc,d", 4);
         assert_eq!(widths, vec![4, 3]);
+    }
+
+    #[test]
+    fn csv_mode_starts_below_pinned_header() {
+        let viewer = test_viewer_with_options(b"h1,h2\nv1,v2\nv3,v4", 4, true);
+        assert_eq!(viewer.top_line, 1);
+    }
+
+    #[test]
+    fn csv_scroll_up_keeps_header_pinned() {
+        let mut viewer = test_viewer_with_options(b"h1,h2\nv1,v2\nv3,v4", 4, true);
+        viewer.scroll_up(10);
+        assert_eq!(viewer.top_line, 1);
+    }
+
+    fn test_viewer_with_options(bytes: &[u8], tab_width: usize, csv: bool) -> Viewer {
+        let nonce = SystemTime::now()
+            .duration_since(UNIX_EPOCH)
+            .expect("time went backwards")
+            .as_nanos();
+        let path: PathBuf =
+            std::env::temp_dir().join(format!("large-file-viewer-test-{nonce}.txt"));
+        fs::write(&path, bytes).expect("failed to write temp file");
+        let viewer = Viewer::open(path.clone(), tab_width, csv).expect("failed to open viewer");
+        fs::remove_file(path).expect("failed to remove temp file");
+        viewer
     }
 }
