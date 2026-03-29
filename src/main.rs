@@ -244,6 +244,7 @@ impl Viewer {
         });
 
         let bytes = &self.mmap[line_start..line_end];
+        let content_start = skipped_prefix_len(line_idx, bytes);
         let mut segments: Vec<(bool, RenderClass, String)> = Vec::new();
         let mut visible_width = 0usize;
         let mut absolute_col = 0usize;
@@ -277,7 +278,7 @@ impl Viewer {
             let mut column_idx = 0usize;
             let mut field_width = 0usize;
 
-            for (idx, &b) in bytes.iter().enumerate() {
+            for (idx, &b) in bytes.iter().enumerate().skip(content_start) {
                 if b == b'\n' || b == b'\r' {
                     continue;
                 }
@@ -315,7 +316,7 @@ impl Viewer {
                 }
             }
         } else {
-            for (idx, &b) in bytes.iter().enumerate() {
+            for (idx, &b) in bytes.iter().enumerate().skip(content_start) {
                 if b == b'\n' || b == b'\r' {
                     continue;
                 }
@@ -440,6 +441,14 @@ impl Viewer {
 
 fn clip_to_width(s: &str, max_width: usize) -> String {
     s.chars().take(max_width).collect()
+}
+
+fn skipped_prefix_len(line_idx: usize, bytes: &[u8]) -> usize {
+    if line_idx == 0 && bytes.starts_with(&[0xEF_u8, 0xBB_u8, 0xBF_u8]) {
+        3
+    } else {
+        0
+    }
 }
 
 fn classify_xml_line(bytes: &[u8]) -> Vec<XmlTokenClass> {
@@ -755,7 +764,7 @@ fn prompt_find(viewer: &Viewer, out: &mut impl Write) -> Result<Option<String>> 
 
 #[cfg(test)]
 mod tests {
-    use super::{centered_top_line, classify_xml_line, Viewer, XmlTokenClass};
+    use super::{centered_top_line, classify_xml_line, skipped_prefix_len, Viewer, XmlTokenClass};
     use std::{
         fs,
         path::PathBuf,
@@ -870,5 +879,13 @@ mod tests {
         assert_eq!(classes[16], XmlTokenClass::Text);
         assert_eq!(classes[17], XmlTokenClass::TagDelimiter);
         assert_eq!(classes[18], XmlTokenClass::TagName);
+    }
+
+    #[test]
+    fn skips_utf8_bom_prefix_on_first_line_only() {
+        let bom_prefixed = [0xEF_u8, 0xBB_u8, 0xBF_u8, b'<', b'x', b'>'];
+        assert_eq!(skipped_prefix_len(0, &bom_prefixed), 3);
+        assert_eq!(skipped_prefix_len(1, &bom_prefixed), 0);
+        assert_eq!(skipped_prefix_len(0, b"<x>"), 0);
     }
 }
