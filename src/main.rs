@@ -673,9 +673,19 @@ fn classify_json_line(bytes: &[u8]) -> Vec<JsonTokenClass> {
     classes
 }
 
+#[derive(Clone, Copy)]
+struct XmlDisplayToken {
+    start: usize,
+    end: usize,
+    is_tag: bool,
+    is_closing: bool,
+    is_opening: bool,
+    is_self_closing: bool,
+}
+
 fn format_xml_for_display(bytes: &[u8]) -> Vec<u8> {
     let mut out = Vec::with_capacity(bytes.len().saturating_add(bytes.len() / 4));
-    let mut depth = 0usize;
+    let mut tokens = Vec::new();
     let mut idx = 0usize;
 
     while idx < bytes.len() {
@@ -686,17 +696,14 @@ fn format_xml_for_display(bytes: &[u8]) -> Vec<u8> {
 
         if bytes[idx] == b'<' {
             let (token_end, is_closing, is_opening, is_self_closing) = xml_tag_bounds(bytes, idx);
-            let line_depth = if is_closing {
-                depth.saturating_sub(1)
-            } else {
-                depth
-            };
-            push_indented_xml_line(&mut out, line_depth, &bytes[idx..token_end]);
-            if is_closing {
-                depth = depth.saturating_sub(1);
-            } else if is_opening && !is_self_closing {
-                depth = depth.saturating_add(1);
-            }
+            tokens.push(XmlDisplayToken {
+                start: idx,
+                end: token_end,
+                is_tag: true,
+                is_closing,
+                is_opening,
+                is_self_closing,
+            });
             idx = token_end;
             continue;
         }
@@ -705,10 +712,55 @@ fn format_xml_for_display(bytes: &[u8]) -> Vec<u8> {
         while idx < bytes.len() && bytes[idx] != b'<' {
             idx += 1;
         }
-        let text = trim_ascii_whitespace(&bytes[text_start..idx]);
-        if !text.is_empty() {
-            push_indented_xml_line(&mut out, depth, text);
+        let (trimmed_start, trimmed_end) = trim_ascii_whitespace_range(bytes, text_start, idx);
+        if trimmed_start < trimmed_end {
+            tokens.push(XmlDisplayToken {
+                start: trimmed_start,
+                end: trimmed_end,
+                is_tag: false,
+                is_closing: false,
+                is_opening: false,
+                is_self_closing: false,
+            });
         }
+    }
+
+    let mut depth = 0usize;
+    let mut i = 0usize;
+    while i < tokens.len() {
+        let token = tokens[i];
+
+        if token.is_tag
+            && token.is_opening
+            && !token.is_self_closing
+            && i + 2 < tokens.len()
+            && !tokens[i + 1].is_tag
+            && tokens[i + 2].is_tag
+            && tokens[i + 2].is_closing
+            && matching_tag_names(bytes, token, tokens[i + 2])
+        {
+            let mut line = Vec::new();
+            line.extend_from_slice(&bytes[token.start..token.end]);
+            line.extend_from_slice(&bytes[tokens[i + 1].start..tokens[i + 1].end]);
+            line.extend_from_slice(&bytes[tokens[i + 2].start..tokens[i + 2].end]);
+            push_indented_xml_line(&mut out, depth, &line);
+            i += 3;
+            continue;
+        }
+
+        let line_depth = if token.is_closing {
+            depth.saturating_sub(1)
+        } else {
+            depth
+        };
+        push_indented_xml_line(&mut out, line_depth, &bytes[token.start..token.end]);
+
+        if token.is_closing {
+            depth = depth.saturating_sub(1);
+        } else if token.is_opening && !token.is_self_closing {
+            depth = depth.saturating_add(1);
+        }
+        i += 1;
     }
 
     if out.last() == Some(&b'\n') {
@@ -718,6 +770,12 @@ fn format_xml_for_display(bytes: &[u8]) -> Vec<u8> {
         out.push(b'\n');
     }
     out
+}
+
+fn matching_tag_names(bytes: &[u8], open: XmlDisplayToken, close: XmlDisplayToken) -> bool {
+    let open_name = extract_tag_name(bytes, open.start, open.end, false);
+    let close_name = extract_tag_name(bytes, close.start, close.end, true);
+    !open_name.is_empty() && open_name == close_name
 }
 
 fn xml_tag_bounds(bytes: &[u8], start: usize) -> (usize, bool, bool, bool) {
@@ -759,6 +817,29 @@ fn xml_tag_bounds(bytes: &[u8], start: usize) -> (usize, bool, bool, bool) {
     )
 }
 
+fn extract_tag_name(bytes: &[u8], start: usize, end: usize, closing: bool) -> &[u8] {
+    if end <= start + 2 {
+        return &[];
+    }
+    let mut idx = start + 1;
+    if closing && idx < end && bytes[idx] == b'/' {
+        idx += 1;
+    }
+    while idx < end && bytes[idx].is_ascii_whitespace() {
+        idx += 1;
+    }
+    let name_start = idx;
+    while idx < end
+        && !bytes[idx].is_ascii_whitespace()
+        && bytes[idx] != b'/'
+        && bytes[idx] != b'>'
+        && bytes[idx] != b'?'
+    {
+        idx += 1;
+    }
+    &bytes[name_start..idx]
+}
+
 fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
     let mut start = 0usize;
     let mut end = bytes.len();
@@ -769,6 +850,18 @@ fn trim_ascii_whitespace(bytes: &[u8]) -> &[u8] {
         end -= 1;
     }
     &bytes[start..end]
+}
+
+fn trim_ascii_whitespace_range(bytes: &[u8], start: usize, end: usize) -> (usize, usize) {
+    let trimmed = trim_ascii_whitespace(&bytes[start..end]);
+    if trimmed.is_empty() {
+        return (start, start);
+    }
+    let leading = bytes[start..end]
+        .iter()
+        .position(|b| !b.is_ascii_whitespace())
+        .unwrap_or(0);
+    (start + leading, start + leading + trimmed.len())
 }
 
 fn push_indented_xml_line(out: &mut Vec<u8>, depth: usize, content: &[u8]) {
@@ -1178,7 +1271,8 @@ mod tests {
         let xml = br#"<root><parent><child/></parent><value>text</value></root>"#;
         let formatted = format_xml_for_display(xml);
         let formatted = String::from_utf8(formatted).expect("formatted xml should be utf8");
-        let expected = "<root>\n  <parent>\n    <child/>\n  </parent>\n  <value>\n    text\n  </value>\n</root>";
+        let expected =
+            "<root>\n  <parent>\n    <child/>\n  </parent>\n  <value>text</value>\n</root>";
         assert_eq!(formatted, expected);
     }
 
