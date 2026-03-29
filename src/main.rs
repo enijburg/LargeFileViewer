@@ -349,20 +349,20 @@ impl Viewer {
         for (is_highlight, render_class, text) in segments {
             if is_highlight {
                 let styled = match render_class {
-                    RenderClass::Text => style::style(text).with(Color::Grey).reverse(),
-                    RenderClass::TagDelimiter => style::style(text).with(Color::DarkCyan).reverse(),
-                    RenderClass::TagName => style::style(text).with(Color::Cyan).reverse(),
-                    RenderClass::AttributeName => style::style(text).with(Color::Magenta).reverse(),
+                    RenderClass::Text => style::style(text).with(Color::White).reverse(),
+                    RenderClass::TagDelimiter => style::style(text).with(Color::Cyan).reverse(),
+                    RenderClass::TagName => style::style(text).with(Color::Magenta).reverse(),
+                    RenderClass::AttributeName => style::style(text).with(Color::Green).reverse(),
                     RenderClass::AttributeValue => style::style(text).with(Color::Yellow).reverse(),
                     RenderClass::Comment => style::style(text).with(Color::DarkGrey).reverse(),
                 };
                 queue!(out, style::PrintStyledContent(styled))?;
             } else {
                 let styled = match render_class {
-                    RenderClass::Text => style::style(text).with(Color::Grey),
-                    RenderClass::TagDelimiter => style::style(text).with(Color::DarkCyan),
-                    RenderClass::TagName => style::style(text).with(Color::Cyan),
-                    RenderClass::AttributeName => style::style(text).with(Color::Magenta),
+                    RenderClass::Text => style::style(text).with(Color::White),
+                    RenderClass::TagDelimiter => style::style(text).with(Color::Cyan),
+                    RenderClass::TagName => style::style(text).with(Color::Magenta),
+                    RenderClass::AttributeName => style::style(text).with(Color::Green),
                     RenderClass::AttributeValue => style::style(text).with(Color::Yellow),
                     RenderClass::Comment => style::style(text).with(Color::DarkGrey),
                 };
