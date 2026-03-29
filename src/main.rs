@@ -50,16 +50,20 @@ struct Viewer {
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum XmlTokenClass {
-    None,
-    Tag,
+    Text,
+    TagDelimiter,
+    TagName,
+    AttributeName,
     AttributeValue,
     Comment,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
 enum RenderClass {
-    Plain,
-    Tag,
+    Text,
+    TagDelimiter,
+    TagName,
+    AttributeName,
     AttributeValue,
     Comment,
 }
@@ -287,25 +291,25 @@ impl Viewer {
                     b',' => {
                         let target_width = column_widths.get(column_idx).copied().unwrap_or(0);
                         for _ in field_width..target_width {
-                            push_char(' ', false, RenderClass::Plain);
+                            push_char(' ', false, RenderClass::Text);
                         }
-                        push_char(',', is_highlight, RenderClass::Plain);
-                        push_char(' ', false, RenderClass::Plain);
+                        push_char(',', is_highlight, RenderClass::Text);
+                        push_char(' ', false, RenderClass::Text);
                         column_idx += 1;
                         field_width = 0;
                     }
                     b'\t' => {
                         for _ in 0..self.tab_width {
-                            push_char(' ', is_highlight, RenderClass::Plain);
+                            push_char(' ', is_highlight, RenderClass::Text);
                             field_width += 1;
                         }
                     }
                     0x20..=0x7e => {
-                        push_char(b as char, is_highlight, RenderClass::Plain);
+                        push_char(b as char, is_highlight, RenderClass::Text);
                         field_width += 1;
                     }
                     _ => {
-                        push_char('·', is_highlight, RenderClass::Plain);
+                        push_char('·', is_highlight, RenderClass::Text);
                         field_width += 1;
                     }
                 }
@@ -321,9 +325,11 @@ impl Viewer {
                     .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
                     .unwrap_or(false);
                 let render_class =
-                    match xml_classes.get(idx).copied().unwrap_or(XmlTokenClass::None) {
-                        XmlTokenClass::None => RenderClass::Plain,
-                        XmlTokenClass::Tag => RenderClass::Tag,
+                    match xml_classes.get(idx).copied().unwrap_or(XmlTokenClass::Text) {
+                        XmlTokenClass::Text => RenderClass::Text,
+                        XmlTokenClass::TagDelimiter => RenderClass::TagDelimiter,
+                        XmlTokenClass::TagName => RenderClass::TagName,
+                        XmlTokenClass::AttributeName => RenderClass::AttributeName,
                         XmlTokenClass::AttributeValue => RenderClass::AttributeValue,
                         XmlTokenClass::Comment => RenderClass::Comment,
                     };
@@ -343,16 +349,20 @@ impl Viewer {
         for (is_highlight, render_class, text) in segments {
             if is_highlight {
                 let styled = match render_class {
-                    RenderClass::Plain => style::style(text).reverse(),
-                    RenderClass::Tag => style::style(text).with(Color::Cyan).reverse(),
+                    RenderClass::Text => style::style(text).with(Color::Grey).reverse(),
+                    RenderClass::TagDelimiter => style::style(text).with(Color::DarkCyan).reverse(),
+                    RenderClass::TagName => style::style(text).with(Color::Cyan).reverse(),
+                    RenderClass::AttributeName => style::style(text).with(Color::Magenta).reverse(),
                     RenderClass::AttributeValue => style::style(text).with(Color::Yellow).reverse(),
                     RenderClass::Comment => style::style(text).with(Color::DarkGrey).reverse(),
                 };
                 queue!(out, style::PrintStyledContent(styled))?;
             } else {
                 let styled = match render_class {
-                    RenderClass::Plain => style::style(text),
-                    RenderClass::Tag => style::style(text).with(Color::Cyan),
+                    RenderClass::Text => style::style(text).with(Color::Grey),
+                    RenderClass::TagDelimiter => style::style(text).with(Color::DarkCyan),
+                    RenderClass::TagName => style::style(text).with(Color::Cyan),
+                    RenderClass::AttributeName => style::style(text).with(Color::Magenta),
                     RenderClass::AttributeValue => style::style(text).with(Color::Yellow),
                     RenderClass::Comment => style::style(text).with(Color::DarkGrey),
                 };
@@ -433,10 +443,11 @@ fn clip_to_width(s: &str, max_width: usize) -> String {
 }
 
 fn classify_xml_line(bytes: &[u8]) -> Vec<XmlTokenClass> {
-    let mut classes = vec![XmlTokenClass::None; bytes.len()];
+    let mut classes = vec![XmlTokenClass::Text; bytes.len()];
     let mut in_tag = false;
     let mut in_quote: Option<u8> = None;
     let mut in_comment = false;
+    let mut saw_tag_name = false;
     let mut idx = 0usize;
 
     while idx < bytes.len() {
@@ -450,6 +461,7 @@ fn classify_xml_line(bytes: &[u8]) -> Vec<XmlTokenClass> {
                 idx += 2;
                 in_comment = false;
                 in_tag = false;
+                saw_tag_name = false;
             }
         } else if let Some(quote) = in_quote {
             classes[idx] = XmlTokenClass::AttributeValue;
@@ -457,12 +469,29 @@ fn classify_xml_line(bytes: &[u8]) -> Vec<XmlTokenClass> {
                 in_quote = None;
             }
         } else if in_tag {
-            classes[idx] = XmlTokenClass::Tag;
-            if b == b'"' || b == b'\'' {
-                classes[idx] = XmlTokenClass::AttributeValue;
-                in_quote = Some(b);
-            } else if b == b'>' {
-                in_tag = false;
+            match b {
+                b'>' => {
+                    classes[idx] = XmlTokenClass::TagDelimiter;
+                    in_tag = false;
+                    saw_tag_name = false;
+                }
+                b'"' | b'\'' => {
+                    classes[idx] = XmlTokenClass::AttributeValue;
+                    in_quote = Some(b);
+                }
+                b'=' | b'/' | b'?' | b'!' => {
+                    classes[idx] = XmlTokenClass::TagDelimiter;
+                }
+                b if b.is_ascii_whitespace() => {
+                    classes[idx] = XmlTokenClass::TagDelimiter;
+                }
+                _ if !saw_tag_name => {
+                    classes[idx] = XmlTokenClass::TagName;
+                    saw_tag_name = true;
+                }
+                _ => {
+                    classes[idx] = XmlTokenClass::AttributeName;
+                }
             }
         } else if b == b'<' {
             if idx + 3 < bytes.len() && bytes[idx..=idx + 3] == *b"<!--" {
@@ -472,10 +501,14 @@ fn classify_xml_line(bytes: &[u8]) -> Vec<XmlTokenClass> {
                 classes[idx + 3] = XmlTokenClass::Comment;
                 idx += 3;
                 in_comment = true;
+                saw_tag_name = false;
             } else {
-                classes[idx] = XmlTokenClass::Tag;
+                classes[idx] = XmlTokenClass::TagDelimiter;
                 in_tag = true;
+                saw_tag_name = false;
             }
+        } else {
+            classes[idx] = XmlTokenClass::Text;
         }
 
         idx += 1;
@@ -813,9 +846,11 @@ mod tests {
     #[test]
     fn classifies_xml_tags_and_attributes() {
         let classes = classify_xml_line(br#"<node attr="value">text</node>"#);
-        assert_eq!(classes[0], XmlTokenClass::Tag);
+        assert_eq!(classes[0], XmlTokenClass::TagDelimiter);
+        assert_eq!(classes[1], XmlTokenClass::TagName);
+        assert_eq!(classes[6], XmlTokenClass::AttributeName);
         assert_eq!(classes[11], XmlTokenClass::AttributeValue);
-        assert_eq!(classes[19], XmlTokenClass::None);
+        assert_eq!(classes[19], XmlTokenClass::Text);
     }
 
     #[test]
@@ -823,7 +858,8 @@ mod tests {
         let classes = classify_xml_line(br#"<!-- comment --> <node/>"#);
         assert_eq!(classes[0], XmlTokenClass::Comment);
         assert_eq!(classes[10], XmlTokenClass::Comment);
-        assert_eq!(classes[16], XmlTokenClass::None);
-        assert_eq!(classes[17], XmlTokenClass::Tag);
+        assert_eq!(classes[16], XmlTokenClass::Text);
+        assert_eq!(classes[17], XmlTokenClass::TagDelimiter);
+        assert_eq!(classes[18], XmlTokenClass::TagName);
     }
 }
