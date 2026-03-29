@@ -349,26 +349,29 @@ impl Viewer {
                 let is_highlight = highlight
                     .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
                     .unwrap_or(false);
-                let render_class =
-                    if self.json_syntax_highlighting {
-                        match json_classes.get(idx).copied().unwrap_or(JsonTokenClass::Text) {
-                            JsonTokenClass::Text => RenderClass::Text,
-                            JsonTokenClass::Delimiter => RenderClass::TagDelimiter,
-                            JsonTokenClass::Key => RenderClass::AttributeName,
-                            JsonTokenClass::String => RenderClass::AttributeValue,
-                            JsonTokenClass::Number => RenderClass::TagName,
-                            JsonTokenClass::Keyword => RenderClass::Comment,
-                        }
-                    } else {
-                        match xml_classes.get(idx).copied().unwrap_or(XmlTokenClass::Text) {
-                            XmlTokenClass::Text => RenderClass::Text,
-                            XmlTokenClass::TagDelimiter => RenderClass::TagDelimiter,
-                            XmlTokenClass::TagName => RenderClass::TagName,
-                            XmlTokenClass::AttributeName => RenderClass::AttributeName,
-                            XmlTokenClass::AttributeValue => RenderClass::AttributeValue,
-                            XmlTokenClass::Comment => RenderClass::Comment,
-                        }
-                    };
+                let render_class = if self.json_syntax_highlighting {
+                    match json_classes
+                        .get(idx)
+                        .copied()
+                        .unwrap_or(JsonTokenClass::Text)
+                    {
+                        JsonTokenClass::Text => RenderClass::Text,
+                        JsonTokenClass::Delimiter => RenderClass::TagDelimiter,
+                        JsonTokenClass::Key => RenderClass::AttributeName,
+                        JsonTokenClass::String => RenderClass::AttributeValue,
+                        JsonTokenClass::Number => RenderClass::TagName,
+                        JsonTokenClass::Keyword => RenderClass::Comment,
+                    }
+                } else {
+                    match xml_classes.get(idx).copied().unwrap_or(XmlTokenClass::Text) {
+                        XmlTokenClass::Text => RenderClass::Text,
+                        XmlTokenClass::TagDelimiter => RenderClass::TagDelimiter,
+                        XmlTokenClass::TagName => RenderClass::TagName,
+                        XmlTokenClass::AttributeName => RenderClass::AttributeName,
+                        XmlTokenClass::AttributeValue => RenderClass::AttributeValue,
+                        XmlTokenClass::Comment => RenderClass::Comment,
+                    }
+                };
 
                 match b {
                     b'\t' => {
@@ -614,7 +617,9 @@ fn classify_json_line(bytes: &[u8]) -> Vec<JsonTokenClass> {
             b'-' | b'0'..=b'9' => {
                 let start = idx;
                 idx += 1;
-                while idx < bytes.len() && matches!(bytes[idx], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-') {
+                while idx < bytes.len()
+                    && matches!(bytes[idx], b'0'..=b'9' | b'.' | b'e' | b'E' | b'+' | b'-')
+                {
                     idx += 1;
                 }
                 for class in classes.iter_mut().take(idx).skip(start) {
@@ -880,8 +885,8 @@ fn prompt_find(viewer: &Viewer, out: &mut impl Write) -> Result<Option<String>> 
 #[cfg(test)]
 mod tests {
     use super::{
-        JsonTokenClass, Viewer, XmlTokenClass, centered_top_line, classify_json_line,
-        classify_xml_line, skipped_prefix_len,
+        centered_top_line, classify_json_line, classify_xml_line, skipped_prefix_len,
+        JsonTokenClass, Viewer, XmlTokenClass,
     };
     use std::{
         fs,
@@ -933,18 +938,22 @@ mod tests {
         assert_eq!(viewer.line_of_offset(12), 2);
     }
 
-    fn test_viewer_from_bytes(bytes: &[u8]) -> Viewer {
+    fn with_temp_file(bytes: &[u8], f: impl FnOnce(PathBuf) -> Viewer) -> Viewer {
         let nonce = SystemTime::now()
             .duration_since(UNIX_EPOCH)
             .expect("time went backwards")
             .as_nanos();
-        let path: PathBuf =
-            std::env::temp_dir().join(format!("large-file-viewer-test-{nonce}.txt"));
+        let path = std::env::temp_dir().join(format!("large-file-viewer-test-{nonce}.txt"));
         fs::write(&path, bytes).expect("failed to write temp file");
-        let viewer =
-            Viewer::open(path.clone(), 4, false, false, false).expect("failed to open viewer");
+        let viewer = f(path.clone());
         fs::remove_file(path).expect("failed to remove temp file");
         viewer
+    }
+
+    fn test_viewer_from_bytes(bytes: &[u8]) -> Viewer {
+        with_temp_file(bytes, |path| {
+            Viewer::open(path, 4, false, false, false).expect("failed to open viewer")
+        })
     }
 
     #[test]
@@ -967,17 +976,9 @@ mod tests {
     }
 
     fn test_viewer_with_options(bytes: &[u8], tab_width: usize, csv: bool) -> Viewer {
-        let nonce = SystemTime::now()
-            .duration_since(UNIX_EPOCH)
-            .expect("time went backwards")
-            .as_nanos();
-        let path: PathBuf =
-            std::env::temp_dir().join(format!("large-file-viewer-test-{nonce}.txt"));
-        fs::write(&path, bytes).expect("failed to write temp file");
-        let viewer =
-            Viewer::open(path.clone(), tab_width, csv, false, false).expect("failed to open viewer");
-        fs::remove_file(path).expect("failed to remove temp file");
-        viewer
+        with_temp_file(bytes, |path| {
+            Viewer::open(path, tab_width, csv, false, false).expect("failed to open viewer")
+        })
     }
 
     #[test]
