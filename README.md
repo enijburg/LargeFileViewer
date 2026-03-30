@@ -50,6 +50,7 @@ The project now also includes a desktop GUI editor (`lfv-gui`) built on the same
 - Memory-map the file with `memmap2` (no full file load).
 - Build a line-offset index once.
 - Render only visible rows with egui virtualization (`ScrollArea::show_rows`).
+- Use the `wgpu` renderer backend (no OpenGL requirement).
 - Keep edits as sparse, in-memory per-line overrides until you save.
 
 Run it with:

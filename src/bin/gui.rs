@@ -208,7 +208,10 @@ impl eframe::App for GuiApp {
 fn main() -> Result<()> {
     let args = Args::parse();
     let doc = Document::open(args.file, args.tab_width)?;
-    let options = eframe::NativeOptions::default();
+    let options = eframe::NativeOptions {
+        renderer: eframe::Renderer::Wgpu,
+        ..Default::default()
+    };
 
     eframe::run_native(
         "Large File Viewer GUI",
