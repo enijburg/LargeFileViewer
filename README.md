@@ -42,6 +42,28 @@ Useful options:
 - `PageUp / PageDown`: scroll by one terminal page
 - `Home / End`: jump to start/end
 
+
+## GUI editor
+
+The project now also includes a desktop GUI editor (`lfv-gui`) built on the same core principles:
+
+- Memory-map the file with `memmap2` (no full file load).
+- Build a line-offset index once.
+- Render only visible rows with egui virtualization (`ScrollArea::show_rows`).
+- Keep edits as sparse, in-memory per-line overrides until you save.
+
+Run it with:
+
+```bash
+cargo run --bin lfv-gui -- path/to/very_large_file.log
+```
+
+GUI usage:
+
+- Double-click a line to edit it.
+- Press `Enter` to apply an edit for that line.
+- Provide a destination path in `Save as` and click `Save` to write an edited copy.
+
 ## Notes
 
 - Best with text files (UTF-8 or ASCII-like content).
