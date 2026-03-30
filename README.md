@@ -13,7 +13,7 @@ This pattern is ideal for large logs, CSVs, and text dumps.
 
 ### Opening a 1GB Xml file in realtime
 
-<video controls src="docs/assets/1GBXmlFile.mp4" title="Title"></video>
+![1GB Xml File](docs/assets/1gbXmlFile.gif)
 
 [![Release Build](https://github.com/enijburg/LargeFileViewer/actions/workflows/release.yml/badge.svg)](https://github.com/enijburg/LargeFileViewer/actions/workflows/release.yml)
 
