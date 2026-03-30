@@ -11,6 +11,17 @@ A terminal-based large file viewer implemented in Rust that uses a **memory-mapp
 
 This pattern is ideal for large logs, CSVs, and text dumps.
 
+### Opening a 1GB Xml file in realtime
+
+<video controls src="docs/assets/1GBXmlFile.mp4" title="Title"></video>
+
+[![Release Build](https://github.com/enijburg/LargeFileViewer/actions/workflows/release.yml/badge.svg)](https://github.com/enijburg/LargeFileViewer/actions/workflows/release.yml)
+
+## Download
+
+[Download latest release](https://github.com/enijburg/LargeFileViewer/releases)
+
+
 ## Build
 
 ```bash
