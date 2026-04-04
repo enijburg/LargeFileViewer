@@ -441,12 +441,22 @@ impl Viewer {
         self.top_line = self.top_line.saturating_sub(by).max(min_top);
     }
 
-    fn scroll_down(&mut self, by: usize) {
+    fn scroll_down(&mut self, by: usize, viewport_rows: usize) {
         if self.line_count() == 0 {
             self.top_line = 0;
             return;
         }
-        self.top_line = min(self.top_line + by, self.line_count() - 1);
+        // In CSV mode the header occupies one viewport row, leaving one fewer row for data.
+        let visible_rows = if self.csv_column_widths.is_some() && viewport_rows > 1 {
+            viewport_rows - 1
+        } else {
+            viewport_rows
+        };
+        let max_top = self.line_count().saturating_sub(visible_rows);
+        // In CSV mode the header row (line 0) is always pinned, so top_line must be at least 1.
+        // The line_count() > 1 guard avoids pinning past the only line in a single-line CSV file.
+        let min_top = usize::from(self.csv_column_widths.is_some() && self.line_count() > 1);
+        self.top_line = min(self.top_line + by, max_top).max(min_top);
     }
 
     fn scroll_left(&mut self, by: usize) {
@@ -1046,7 +1056,7 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                             needs_redraw = true;
                         }
                         KeyCode::Down => {
-                            viewer.scroll_down(1);
+                            viewer.scroll_down(1, page);
                             needs_redraw = true;
                         }
                         KeyCode::PageUp => {
@@ -1054,7 +1064,7 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                             needs_redraw = true;
                         }
                         KeyCode::PageDown => {
-                            viewer.scroll_down(page.max(1));
+                            viewer.scroll_down(page.max(1), page);
                             needs_redraw = true;
                         }
                         KeyCode::Home => {
@@ -1062,9 +1072,7 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                             needs_redraw = true;
                         }
                         KeyCode::End => {
-                            if viewer.line_count() > 0 {
-                                viewer.top_line = viewer.line_count() - 1;
-                            }
+                            viewer.scroll_down(usize::MAX, page);
                             needs_redraw = true;
                         }
                         _ => {}
