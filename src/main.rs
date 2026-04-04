@@ -206,6 +206,7 @@ impl Viewer {
         let (width, height) = terminal::size().context("Failed to get terminal size")?;
         let body_rows = height.saturating_sub(2) as usize;
         let width = width as usize;
+        let content_width = width.saturating_sub(1);
 
         // Synchronized updates reduce perceived flicker by presenting the frame at once.
         queue!(
@@ -229,7 +230,7 @@ impl Viewer {
         )?;
 
         if self.csv_column_widths.is_some() && self.line_count() > 0 {
-            self.render_line(out, 0, width)?;
+            self.render_line(out, 0, content_width)?;
             queue!(out, cursor::MoveToNextLine(1))?;
 
             let start = self.top_line.max(1);
@@ -239,7 +240,7 @@ impl Viewer {
                     break;
                 }
 
-                self.render_line(out, line_idx, width)?;
+                self.render_line(out, line_idx, content_width)?;
                 queue!(out, cursor::MoveToNextLine(1))?;
             }
         } else {
@@ -249,10 +250,12 @@ impl Viewer {
                     break;
                 }
 
-                self.render_line(out, line_idx, width)?;
+                self.render_line(out, line_idx, content_width)?;
                 queue!(out, cursor::MoveToNextLine(1))?;
             }
         }
+
+        self.render_scrollbar(out, width, body_rows)?;
 
         let footer = "Memory-mapped view (renders visible window only)";
         let clipped_footer = clip_to_width(footer, width);
@@ -431,6 +434,55 @@ impl Viewer {
                 };
                 queue!(out, style::PrintStyledContent(styled))?;
             }
+        }
+
+        Ok(())
+    }
+
+    fn render_scrollbar(
+        &self,
+        out: &mut impl Write,
+        width: usize,
+        body_rows: usize,
+    ) -> Result<()> {
+        if width == 0 || body_rows == 0 {
+            return Ok(());
+        }
+
+        let scrollbar_col = (width - 1) as u16;
+        let line_count = self.line_count();
+
+        let (thumb_top, thumb_bottom) = if line_count <= body_rows {
+            (0, body_rows)
+        } else {
+            let thumb_size = body_rows
+                .saturating_mul(body_rows)
+                .checked_div(line_count)
+                .unwrap_or(body_rows)
+                .max(1)
+                .min(body_rows);
+            let scrollable = line_count - body_rows;
+            let thumb_top = self
+                .top_line
+                .saturating_mul(body_rows - thumb_size)
+                .checked_div(scrollable)
+                .unwrap_or(0)
+                .min(body_rows - thumb_size);
+            (thumb_top, (thumb_top + thumb_size).min(body_rows))
+        };
+
+        for row in 0..body_rows {
+            let screen_row = row as u16 + 1; // +1 because row 0 is the status bar
+            let ch = if row >= thumb_top && row < thumb_bottom {
+                '█'
+            } else {
+                '░'
+            };
+            queue!(
+                out,
+                cursor::MoveTo(scrollbar_col, screen_row),
+                style::PrintStyledContent(style::style(ch).dark_grey())
+            )?;
         }
 
         Ok(())
