@@ -6,6 +6,142 @@ use std::{
     time::Duration,
 };
 
+mod updater {
+    use anyhow::{Context, Result};
+    use std::{
+        env,
+        fs,
+        io::Read,
+        path::PathBuf,
+    };
+
+    // This updater targets the Windows x86_64 release asset, which is the only
+    // platform currently supported by the release workflow.
+    const REPO: &str = "enijburg/LargeFileViewer";
+    const ASSET_NAME: &str = "lfv-x86_64-pc-windows-msvc.zip";
+    #[cfg(windows)]
+    const BINARY_IN_ZIP: &str = "lfv.exe";
+    #[cfg(not(windows))]
+    const BINARY_IN_ZIP: &str = "lfv";
+
+    /// Silently remove any stale `<exe>.old` left over from a previous update.
+    pub fn cleanup_old_executable() {
+        if let Ok(exe) = env::current_exe() {
+            let old = old_exe_path(&exe);
+            if old.exists() {
+                let _ = fs::remove_file(old);
+            }
+        }
+    }
+
+    /// Download the latest release from GitHub and replace the running executable.
+    pub fn do_update() -> Result<()> {
+        let current_version = env!("CARGO_PKG_VERSION");
+
+        println!("Checking for updates (current version: v{current_version})...");
+
+        // Fetch latest release metadata.
+        let url = format!("https://api.github.com/repos/{REPO}/releases/latest");
+        let response: serde_json::Value = ureq::get(&url)
+            .header("User-Agent", concat!("lfv/", env!("CARGO_PKG_VERSION")))
+            .call()
+            .context("Failed to fetch latest release info")?
+            .body_mut()
+            .read_json()
+            .context("Failed to parse release JSON")?;
+
+        let tag = response["tag_name"]
+            .as_str()
+            .context("Missing tag_name in release JSON")?;
+        let latest_version = tag.trim_start_matches('v');
+
+        if latest_version == current_version {
+            println!("Already on the latest version (v{current_version}). No update needed.");
+            return Ok(());
+        }
+
+        // Find the asset download URL.
+        let assets = response["assets"]
+            .as_array()
+            .context("Missing assets in release JSON")?;
+        let download_url = assets
+            .iter()
+            .find(|a| a["name"].as_str() == Some(ASSET_NAME))
+            .and_then(|a| a["browser_download_url"].as_str())
+            .with_context(|| format!("Asset '{ASSET_NAME}' not found in release {tag}"))?;
+
+        println!("Downloading v{latest_version}...");
+
+        // Download the zip.
+        let zip_bytes = {
+            let mut body = ureq::get(download_url)
+                .header("User-Agent", concat!("lfv/", env!("CARGO_PKG_VERSION")))
+                .call()
+                .context("Failed to download release asset")?;
+            let mut buf = Vec::new();
+            body.body_mut()
+                .as_reader()
+                .read_to_end(&mut buf)
+                .context("Failed to read downloaded bytes")?;
+            buf
+        };
+
+        // Extract the binary from the zip.
+        let cursor = std::io::Cursor::new(&zip_bytes);
+        let mut archive = zip::ZipArchive::new(cursor).context("Failed to open zip archive")?;
+        let mut zip_entry = archive
+            .by_name(BINARY_IN_ZIP)
+            .with_context(|| format!("'{BINARY_IN_ZIP}' not found in zip"))?;
+        let mut new_binary = Vec::new();
+        std::io::copy(&mut zip_entry, &mut new_binary)
+            .context("Failed to extract binary from zip")?;
+        drop(zip_entry);
+
+        // Write new binary next to the current executable under a temp name.
+        let exe = env::current_exe().context("Failed to determine current executable path")?;
+        let tmp_path = exe.with_extension("tmp");
+        fs::write(&tmp_path, &new_binary).context("Failed to write new binary to disk")?;
+
+        // Rename current exe → .old, then move the new binary into place.
+        let old_path = old_exe_path(&exe);
+        fs::rename(&exe, &old_path)
+            .context("Failed to rename current executable to .old")?;
+        if let Err(e) = fs::rename(&tmp_path, &exe) {
+            // Attempt to roll back so the user isn't left without a binary.
+            let rolled_back = fs::rename(&old_path, &exe).is_ok();
+            let _ = fs::remove_file(&tmp_path);
+            if rolled_back {
+                return Err(e).context(
+                    "Failed to move new executable into place; the original binary has been restored",
+                );
+            } else {
+                return Err(e).context(
+                    "Failed to move new executable into place and rollback also failed; \
+                     the old binary may still exist with a .old suffix",
+                );
+            }
+        }
+
+        println!("Successfully updated to v{latest_version}. The old binary will be removed on next launch.");
+        Ok(())
+    }
+
+    fn old_exe_path(exe: &PathBuf) -> PathBuf {
+        let mut old = exe.clone();
+        let new_name = match exe.file_name().and_then(|n| n.to_str()) {
+            Some(name) => {
+                let stem = name
+                    .strip_suffix(std::env::consts::EXE_SUFFIX)
+                    .unwrap_or(name);
+                format!("{stem}.old")
+            }
+            None => "lfv.old".to_string(),
+        };
+        old.set_file_name(new_name);
+        old
+    }
+}
+
 use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
@@ -21,7 +157,11 @@ use memmap2::Mmap;
 #[command(version, about = "Memory-mapped large file viewer for Windows x64")]
 struct Args {
     /// File path to view.
-    file: PathBuf,
+    file: Option<PathBuf>,
+
+    /// Download and install the latest release from GitHub, then exit.
+    #[arg(long)]
+    update: bool,
 
     /// Number of spaces a tab represents when rendering.
     #[arg(long, default_value_t = 4)]
@@ -1035,9 +1175,20 @@ fn format_json_for_display(bytes: &[u8]) -> Option<Vec<u8>> {
 }
 
 fn main() -> Result<()> {
+    updater::cleanup_old_executable();
+
     let args = Args::parse();
+
+    if args.update {
+        return updater::do_update();
+    }
+
+    let file = args
+        .file
+        .context("A file path is required for viewing. Run `lfv --help` for usage.")?;
+
     let mut viewer = Viewer::open(
-        args.file,
+        file,
         args.tab_width,
         args.csv,
         args.xml,
