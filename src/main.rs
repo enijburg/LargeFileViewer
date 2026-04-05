@@ -10,7 +10,7 @@ use anyhow::{Context, Result};
 use clap::Parser;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind},
     execute, queue,
     style::{self, Color, Stylize},
     terminal::{self, ClearType},
@@ -504,6 +504,40 @@ impl Viewer {
     fn scroll_left(&mut self, by: usize) {
         self.left_col = self.left_col.saturating_sub(by);
     }
+
+    /// Maps a scrollbar screen row (0-indexed from top of terminal) to `top_line`,
+    /// using the inverse of the thumb-position formula used in `render_scrollbar`.
+    fn scroll_to_scrollbar_row(&mut self, screen_row: usize, body_rows: usize) {
+        let line_count = self.line_count();
+        if body_rows == 0 || line_count <= body_rows {
+            return;
+        }
+        // screen_row 0 is the status bar; body rows start at screen row 1.
+        let row = screen_row.saturating_sub(1).min(body_rows.saturating_sub(1));
+
+        let thumb_size = body_rows
+            .saturating_mul(body_rows)
+            .checked_div(line_count)
+            .unwrap_or(body_rows)
+            .max(1)
+            .min(body_rows);
+
+        let scrollable = line_count - body_rows;
+        let track_rows = body_rows.saturating_sub(thumb_size);
+
+        let top_line = if track_rows == 0 {
+            0
+        } else {
+            row.saturating_mul(scrollable)
+                .checked_div(track_rows)
+                .unwrap_or(0)
+                .min(scrollable)
+        };
+
+        let min_top = usize::from(self.csv_column_widths.is_some() && line_count > 1);
+        self.top_line = top_line.max(min_top);
+    }
+
 
     fn scroll_right(&mut self, by: usize) {
         self.left_col = self.left_col.saturating_add(by);
@@ -1003,11 +1037,11 @@ fn main() -> Result<()> {
 
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide)?;
+    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide, event::EnableMouseCapture)?;
 
     let run_result = run_event_loop(&mut viewer, &mut stdout);
 
-    execute!(stdout, cursor::Show, terminal::LeaveAlternateScreen)?;
+    execute!(stdout, event::DisableMouseCapture, cursor::Show, terminal::LeaveAlternateScreen)?;
     terminal::disable_raw_mode().context("Failed to disable raw mode")?;
 
     run_result
@@ -1015,6 +1049,7 @@ fn main() -> Result<()> {
 
 fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
     let mut needs_redraw = true;
+    let mut scrollbar_drag = false;
 
     loop {
         if needs_redraw {
@@ -1123,6 +1158,37 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                     }
                 }
                 Event::Resize(_, _) => needs_redraw = true,
+                Event::Mouse(mouse) => {
+                    let (width, height) =
+                        terminal::size().context("Failed to get terminal size")?;
+                    let body_rows = height.saturating_sub(2) as usize;
+                    let scrollbar_col = width.saturating_sub(1);
+                    match mouse.kind {
+                        MouseEventKind::Down(MouseButton::Left)
+                            if mouse.column == scrollbar_col =>
+                        {
+                            scrollbar_drag = true;
+                            viewer.scroll_to_scrollbar_row(mouse.row as usize, body_rows);
+                            needs_redraw = true;
+                        }
+                        MouseEventKind::Drag(MouseButton::Left) if scrollbar_drag => {
+                            viewer.scroll_to_scrollbar_row(mouse.row as usize, body_rows);
+                            needs_redraw = true;
+                        }
+                        MouseEventKind::Up(MouseButton::Left) => {
+                            scrollbar_drag = false;
+                        }
+                        MouseEventKind::ScrollDown => {
+                            viewer.scroll_down(3);
+                            needs_redraw = true;
+                        }
+                        MouseEventKind::ScrollUp => {
+                            viewer.scroll_up(3);
+                            needs_redraw = true;
+                        }
+                        _ => {}
+                    }
+                }
                 _ => {}
             }
         }
