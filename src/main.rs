@@ -1187,7 +1187,7 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                             scrollbar_drag = false;
                         }
                         MouseEventKind::ScrollDown => {
-                            viewer.scroll_down(3);
+                            viewer.scroll_down(3, body_rows);
                             needs_redraw = true;
                         }
                         MouseEventKind::ScrollUp => {
