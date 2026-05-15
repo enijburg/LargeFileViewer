@@ -27,9 +27,13 @@ struct Args {
     #[arg(long, default_value_t = 4)]
     tab_width: usize,
 
-    /// Render comma-separated values in aligned columns.
+    /// Render delimited values in aligned columns.
     #[arg(long)]
     csv: bool,
+
+    /// Field separator for --csv mode (single ASCII character, e.g. ",", ";", "\t", "|").
+    #[arg(long)]
+    csv_separator: Option<String>,
 
     /// Enable rudimentary XML syntax highlighting.
     #[arg(long)]
@@ -52,6 +56,7 @@ struct Viewer {
     left_col: usize,
     tab_width: usize,
     csv_column_widths: Option<Vec<usize>>,
+    csv_separator: Option<u8>,
     xml_syntax_highlighting: bool,
     json_syntax_highlighting: bool,
     search_query: Option<Vec<u8>>,
@@ -97,11 +102,52 @@ fn centered_top_line(target_line: usize, viewport_rows: usize, line_count: usize
     centered.min(line_count - 1)
 }
 
+fn resolve_csv_separator(user_separator: Option<&str>, bytes: &[u8]) -> Result<u8> {
+    if let Some(separator) = user_separator {
+        return parse_csv_separator(separator);
+    }
+    Ok(detect_csv_separator(bytes))
+}
+
+fn parse_csv_separator(raw: &str) -> Result<u8> {
+    let separator = match raw {
+        r"\t" => b'\t',
+        _ => {
+            let bytes = raw.as_bytes();
+            if bytes.len() != 1 || !bytes[0].is_ascii() {
+                anyhow::bail!("--csv-separator must be a single ASCII character or \\t");
+            }
+            bytes[0]
+        }
+    };
+    Ok(separator)
+}
+
+fn detect_csv_separator(bytes: &[u8]) -> u8 {
+    const CANDIDATES: [u8; 5] = [b',', b';', b'\t', b'|', b':'];
+    let sample_lines = bytes
+        .split(|&b| b == b'\n')
+        .take(50)
+        .filter(|line| !line.is_empty());
+    let mut best = (b',', 0usize);
+    for candidate in CANDIDATES {
+        let count = sample_lines
+            .clone()
+            .map(|line| line.iter().filter(|&&b| b == candidate).count())
+            .sum();
+        if count > best.1 {
+            best = (candidate, count);
+        }
+    }
+    best.0
+}
+
 impl Viewer {
     fn open(
         path: PathBuf,
         tab_width: usize,
         csv: bool,
+        csv_separator: Option<&str>,
         xml_syntax_highlighting: bool,
         xml_formatting: bool,
         json_syntax_highlighting: bool,
@@ -126,7 +172,13 @@ impl Viewer {
         };
         let source_bytes = formatted_view.as_deref().unwrap_or(&mmap);
         let line_offsets = Self::index_lines(source_bytes);
-        let csv_column_widths = csv.then(|| Self::index_csv_column_widths(source_bytes, tab_width));
+        let csv_separator = if csv {
+            Some(resolve_csv_separator(csv_separator, source_bytes)?)
+        } else {
+            None
+        };
+        let csv_column_widths = csv_separator
+            .map(|separator| Self::index_csv_column_widths(source_bytes, tab_width, separator));
 
         let top_line = if csv && line_offsets.len() > 1 { 1 } else { 0 };
 
@@ -138,6 +190,7 @@ impl Viewer {
             left_col: 0,
             tab_width,
             csv_column_widths,
+            csv_separator,
             xml_syntax_highlighting,
             json_syntax_highlighting,
             search_query: None,
@@ -166,7 +219,7 @@ impl Viewer {
         self.line_offsets.len()
     }
 
-    fn index_csv_column_widths(bytes: &[u8], tab_width: usize) -> Vec<usize> {
+    fn index_csv_column_widths(bytes: &[u8], tab_width: usize, separator: u8) -> Vec<usize> {
         let mut widths: Vec<usize> = Vec::new();
         let mut column = 0usize;
         let mut current_width = 0usize;
@@ -182,7 +235,7 @@ impl Viewer {
                     current_width = 0;
                 }
                 b'\r' => {}
-                b',' => {
+                b if b == separator => {
                     if widths.len() <= column {
                         widths.resize(column + 1, 0);
                     }
@@ -326,6 +379,7 @@ impl Viewer {
         };
 
         if let Some(column_widths) = &self.csv_column_widths {
+            let separator = self.csv_separator.unwrap_or(b',');
             let mut column_idx = 0usize;
             let mut field_width = 0usize;
 
@@ -340,12 +394,12 @@ impl Viewer {
                     .unwrap_or(false);
 
                 match b {
-                    b',' => {
+                    b if b == separator => {
                         let target_width = column_widths.get(column_idx).copied().unwrap_or(0);
                         for _ in field_width..target_width {
                             push_char(' ', false, RenderClass::Text);
                         }
-                        push_char(',', is_highlight, RenderClass::Text);
+                        push_char(separator as char, is_highlight, RenderClass::Text);
                         push_char(' ', false, RenderClass::Text);
                         column_idx += 1;
                         field_width = 0;
@@ -439,12 +493,7 @@ impl Viewer {
         Ok(())
     }
 
-    fn render_scrollbar(
-        &self,
-        out: &mut impl Write,
-        width: usize,
-        body_rows: usize,
-    ) -> Result<()> {
+    fn render_scrollbar(&self, out: &mut impl Write, width: usize, body_rows: usize) -> Result<()> {
         if width == 0 || body_rows == 0 {
             return Ok(());
         }
@@ -523,7 +572,9 @@ impl Viewer {
             return;
         }
         // screen_row 0 is the status bar; body rows start at screen row 1.
-        let row = screen_row.saturating_sub(1).min(body_rows.saturating_sub(1));
+        let row = screen_row
+            .saturating_sub(1)
+            .min(body_rows.saturating_sub(1));
 
         let thumb_size = body_rows
             .saturating_mul(body_rows)
@@ -547,7 +598,6 @@ impl Viewer {
         let min_top = usize::from(self.csv_column_widths.is_some() && line_count > 1);
         self.top_line = top_line.max(min_top);
     }
-
 
     fn scroll_right(&mut self, by: usize) {
         self.left_col = self.left_col.saturating_add(by);
@@ -1040,6 +1090,7 @@ fn main() -> Result<()> {
         args.file,
         args.tab_width,
         args.csv,
+        args.csv_separator.as_deref(),
         args.xml,
         args.format,
         args.json,
@@ -1047,11 +1098,21 @@ fn main() -> Result<()> {
 
     terminal::enable_raw_mode().context("Failed to enable raw mode")?;
     let mut stdout = io::stdout();
-    execute!(stdout, terminal::EnterAlternateScreen, cursor::Hide, event::EnableMouseCapture)?;
+    execute!(
+        stdout,
+        terminal::EnterAlternateScreen,
+        cursor::Hide,
+        event::EnableMouseCapture
+    )?;
 
     let run_result = run_event_loop(&mut viewer, &mut stdout);
 
-    execute!(stdout, event::DisableMouseCapture, cursor::Show, terminal::LeaveAlternateScreen)?;
+    execute!(
+        stdout,
+        event::DisableMouseCapture,
+        cursor::Show,
+        terminal::LeaveAlternateScreen
+    )?;
     terminal::disable_raw_mode().context("Failed to disable raw mode")?;
 
     run_result
@@ -1301,8 +1362,9 @@ fn prompt_find(viewer: &Viewer, out: &mut impl Write) -> Result<Option<String>> 
 #[cfg(test)]
 mod tests {
     use super::{
-        centered_top_line, classify_json_line, classify_xml_line, format_json_for_display,
-        format_xml_for_display, skipped_prefix_len, JsonTokenClass, Viewer, XmlTokenClass,
+        centered_top_line, classify_json_line, classify_xml_line, detect_csv_separator,
+        format_json_for_display, format_xml_for_display, parse_csv_separator, skipped_prefix_len,
+        JsonTokenClass, Viewer, XmlTokenClass,
     };
     use std::{
         fs,
@@ -1368,13 +1430,13 @@ mod tests {
 
     fn test_viewer_from_bytes(bytes: &[u8]) -> Viewer {
         with_temp_file(bytes, |path| {
-            Viewer::open(path, 4, false, false, false, false).expect("failed to open viewer")
+            Viewer::open(path, 4, false, None, false, false, false).expect("failed to open viewer")
         })
     }
 
     #[test]
     fn indexes_csv_column_widths() {
-        let widths = Viewer::index_csv_column_widths(b"a,bbb\ncccc,d", 4);
+        let widths = Viewer::index_csv_column_widths(b"a,bbb\ncccc,d", 4, b',');
         assert_eq!(widths, vec![4, 3]);
     }
 
@@ -1391,9 +1453,20 @@ mod tests {
         assert_eq!(viewer.top_line, 1);
     }
 
+    #[test]
+    fn auto_detects_semicolon_separator() {
+        assert_eq!(detect_csv_separator(b"h1;h2\na;b\nc;d"), b';');
+    }
+
+    #[test]
+    fn parses_tab_separator_escape() {
+        assert_eq!(parse_csv_separator(r"\t").expect("should parse"), b'\t');
+    }
+
     fn test_viewer_with_options(bytes: &[u8], tab_width: usize, csv: bool) -> Viewer {
         with_temp_file(bytes, |path| {
-            Viewer::open(path, tab_width, csv, false, false, false).expect("failed to open viewer")
+            Viewer::open(path, tab_width, csv, None, false, false, false)
+                .expect("failed to open viewer")
         })
     }
 
