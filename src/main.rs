@@ -7,8 +7,8 @@ use std::{
 };
 
 use anyhow::{Context, Result};
-use arboard::Clipboard;
 use clap::Parser;
+use copypasta::{ClipboardContext, ClipboardProvider};
 use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
@@ -1347,7 +1347,7 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
     let mut needs_redraw = true;
     let mut scrollbar_drag = false;
     let mut selection_drag = false;
-    let mut clipboard = Clipboard::new().ok();
+    let mut clipboard = ClipboardContext::new().ok();
 
     loop {
         if needs_redraw {
@@ -1587,7 +1587,10 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
     Ok(())
 }
 
-fn copy_selection_to_clipboard(viewer: &mut Viewer, clipboard: &mut Option<Clipboard>) -> bool {
+fn copy_selection_to_clipboard(
+    viewer: &mut Viewer,
+    clipboard: &mut Option<ClipboardContext>,
+) -> bool {
     if let Some((top, bottom, left, right)) = viewer.block_selection_range() {
         let mut text = String::new();
         for line_idx in top..=bottom {
@@ -1605,7 +1608,7 @@ fn copy_selection_to_clipboard(viewer: &mut Viewer, clipboard: &mut Option<Clipb
             }
         }
         if let Some(cb) = clipboard.as_mut() {
-            if cb.set_text(text).is_ok() {
+            if cb.set_contents(text).is_ok() {
                 viewer.status_message = Some("Copied block selection to clipboard".to_string());
             } else {
                 viewer.status_message = Some("Failed to copy selection to clipboard".to_string());
@@ -1622,7 +1625,7 @@ fn copy_selection_to_clipboard(viewer: &mut Viewer, clipboard: &mut Option<Clipb
 
     let copied = String::from_utf8_lossy(&viewer.view_bytes()[start..end]).to_string();
     if let Some(cb) = clipboard.as_mut() {
-        if cb.set_text(copied).is_ok() {
+        if cb.set_contents(copied).is_ok() {
             viewer.status_message = Some(format!("Copied {} bytes to clipboard", end - start));
         } else {
             viewer.status_message = Some("Failed to copy selection to clipboard".to_string());
