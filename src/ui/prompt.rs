@@ -4,7 +4,7 @@ use crossterm::{
     cursor,
     event::{self, Event, KeyCode, KeyEventKind},
     queue,
-    style::Stylize,
+    style::{self, Stylize},
     terminal::{self, ClearType},
 };
 use std::io::Write;
