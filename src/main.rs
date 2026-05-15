@@ -66,6 +66,8 @@ struct Viewer {
     cursor_offset: usize,
     selection_anchor: Option<usize>,
     selection_focus: Option<usize>,
+    block_selection_anchor: Option<(usize, usize)>,
+    block_selection_focus: Option<(usize, usize)>,
     status_message: Option<String>,
 }
 
@@ -204,6 +206,8 @@ impl Viewer {
             cursor_offset: 0,
             selection_anchor: None,
             selection_focus: None,
+            block_selection_anchor: None,
+            block_selection_focus: None,
             status_message: None,
         })
     }
@@ -360,6 +364,7 @@ impl Viewer {
                 None
             }
         });
+        let block_selection = self.block_selection_range();
         let bytes = &view_bytes[line_start..line_end];
         let content_start = skipped_prefix_len(line_idx, bytes);
         let mut segments: Vec<(bool, RenderClass, String)> = Vec::new();
@@ -376,28 +381,6 @@ impl Viewer {
             .then(Vec::new)
             .unwrap_or_else(|| classify_json_line(bytes));
 
-        let mut push_char = |c: char, is_highlight: bool, render_class: RenderClass| {
-            if absolute_col < self.left_col {
-                absolute_col += 1;
-                return;
-            }
-            if visible_width >= max_width {
-                absolute_col += 1;
-                return;
-            }
-            if segments
-                .last()
-                .map(|(h, class, _)| *h != is_highlight || *class != render_class)
-                .unwrap_or(true)
-            {
-                segments.push((is_highlight, render_class, String::new()));
-            }
-            let (_, _, target) = segments.last_mut().expect("segment just pushed");
-            target.push(c);
-            visible_width += 1;
-            absolute_col += 1;
-        };
-
         if let Some(column_widths) = &self.csv_column_widths {
             let separator = self.csv_separator.unwrap_or(b',');
             let mut column_idx = 0usize;
@@ -412,7 +395,17 @@ impl Viewer {
                 let is_selected = selection
                     .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
                     .unwrap_or(false);
+                let current_col = absolute_col;
+                let is_block_selected = if let Some((top, bottom, left, right)) = block_selection {
+                    line_idx >= top
+                        && line_idx <= bottom
+                        && current_col >= left
+                        && current_col <= right
+                } else {
+                    false
+                };
                 let is_highlight = is_selected
+                    || is_block_selected
                     || highlight
                         .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
                         .unwrap_or(false);
@@ -421,25 +414,79 @@ impl Viewer {
                     b if b == separator => {
                         let target_width = column_widths.get(column_idx).copied().unwrap_or(0);
                         for _ in field_width..target_width {
-                            push_char(' ', false, RenderClass::Text);
+                            push_char(
+                                ' ',
+                                false,
+                                RenderClass::Text,
+                                self.left_col,
+                                max_width,
+                                &mut absolute_col,
+                                &mut visible_width,
+                                &mut segments,
+                            );
                         }
-                        push_char(separator as char, is_highlight, RenderClass::Text);
-                        push_char(' ', false, RenderClass::Text);
+                        push_char(
+                            separator as char,
+                            is_highlight,
+                            RenderClass::Text,
+                            self.left_col,
+                            max_width,
+                            &mut absolute_col,
+                            &mut visible_width,
+                            &mut segments,
+                        );
+                        push_char(
+                            ' ',
+                            false,
+                            RenderClass::Text,
+                            self.left_col,
+                            max_width,
+                            &mut absolute_col,
+                            &mut visible_width,
+                            &mut segments,
+                        );
                         column_idx += 1;
                         field_width = 0;
                     }
                     b'\t' => {
                         for _ in 0..self.tab_width {
-                            push_char(' ', is_highlight, RenderClass::Text);
+                            push_char(
+                                ' ',
+                                is_highlight,
+                                RenderClass::Text,
+                                self.left_col,
+                                max_width,
+                                &mut absolute_col,
+                                &mut visible_width,
+                                &mut segments,
+                            );
                             field_width += 1;
                         }
                     }
                     0x20..=0x7e => {
-                        push_char(b as char, is_highlight, RenderClass::Text);
+                        push_char(
+                            b as char,
+                            is_highlight,
+                            RenderClass::Text,
+                            self.left_col,
+                            max_width,
+                            &mut absolute_col,
+                            &mut visible_width,
+                            &mut segments,
+                        );
                         field_width += 1;
                     }
                     _ => {
-                        push_char('·', is_highlight, RenderClass::Text);
+                        push_char(
+                            '·',
+                            is_highlight,
+                            RenderClass::Text,
+                            self.left_col,
+                            max_width,
+                            &mut absolute_col,
+                            &mut visible_width,
+                            &mut segments,
+                        );
                         field_width += 1;
                     }
                 }
@@ -454,7 +501,17 @@ impl Viewer {
                 let is_selected = selection
                     .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
                     .unwrap_or(false);
+                let current_col = absolute_col;
+                let is_block_selected = if let Some((top, bottom, left, right)) = block_selection {
+                    line_idx >= top
+                        && line_idx <= bottom
+                        && current_col >= left
+                        && current_col <= right
+                } else {
+                    false
+                };
                 let is_highlight = is_selected
+                    || is_block_selected
                     || highlight
                         .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
                         .unwrap_or(false);
@@ -485,11 +542,38 @@ impl Viewer {
                 match b {
                     b'\t' => {
                         for _ in 0..self.tab_width {
-                            push_char(' ', is_highlight, render_class);
+                            push_char(
+                                ' ',
+                                is_highlight,
+                                render_class,
+                                self.left_col,
+                                max_width,
+                                &mut absolute_col,
+                                &mut visible_width,
+                                &mut segments,
+                            );
                         }
                     }
-                    0x20..=0x7e => push_char(b as char, is_highlight, render_class),
-                    _ => push_char('·', is_highlight, render_class),
+                    0x20..=0x7e => push_char(
+                        b as char,
+                        is_highlight,
+                        render_class,
+                        self.left_col,
+                        max_width,
+                        &mut absolute_col,
+                        &mut visible_width,
+                        &mut segments,
+                    ),
+                    _ => push_char(
+                        '·',
+                        is_highlight,
+                        render_class,
+                        self.left_col,
+                        max_width,
+                        &mut absolute_col,
+                        &mut visible_width,
+                        &mut segments,
+                    ),
                 }
             }
         }
@@ -688,6 +772,48 @@ impl Viewer {
     fn clear_selection(&mut self) {
         self.selection_anchor = None;
         self.selection_focus = None;
+        self.block_selection_anchor = None;
+        self.block_selection_focus = None;
+    }
+
+    fn block_selection_range(&self) -> Option<(usize, usize, usize, usize)> {
+        let (a_line, a_col) = self.block_selection_anchor?;
+        let (b_line, b_col) = self.block_selection_focus?;
+        if a_line == b_line && a_col == b_col {
+            None
+        } else {
+            Some((
+                a_line.min(b_line),
+                a_line.max(b_line),
+                a_col.min(b_col),
+                a_col.max(b_col),
+            ))
+        }
+    }
+
+    fn line_display_chars(&self, line_idx: usize) -> Vec<char> {
+        let line_start = self.line_offsets[line_idx];
+        let view = self.view_bytes();
+        let line_end = if line_idx + 1 < self.line_offsets.len() {
+            self.line_offsets[line_idx + 1]
+        } else {
+            view.len()
+        };
+        let bytes = &view[line_start..line_end];
+        let mut out = Vec::new();
+        for &b in bytes.iter().skip(skipped_prefix_len(line_idx, bytes)) {
+            if b == b'\n' || b == b'\r' {
+                continue;
+            }
+            if b == b'\t' {
+                out.extend(std::iter::repeat_n(' ', self.tab_width));
+            } else if (0x20..=0x7e).contains(&b) {
+                out.push(b as char);
+            } else {
+                out.push('·');
+            }
+        }
+        out
     }
 
     fn offset_for_line_col(&self, line_idx: usize, target_col: usize) -> usize {
@@ -719,6 +845,37 @@ impl Viewer {
 
 fn clip_to_width(s: &str, max_width: usize) -> String {
     s.chars().take(max_width).collect()
+}
+
+fn push_char(
+    c: char,
+    is_highlight: bool,
+    render_class: RenderClass,
+    left_col: usize,
+    max_width: usize,
+    absolute_col: &mut usize,
+    visible_width: &mut usize,
+    segments: &mut Vec<(bool, RenderClass, String)>,
+) {
+    if *absolute_col < left_col {
+        *absolute_col += 1;
+        return;
+    }
+    if *visible_width >= max_width {
+        *absolute_col += 1;
+        return;
+    }
+    if segments
+        .last()
+        .map(|(h, class, _)| *h != is_highlight || *class != render_class)
+        .unwrap_or(true)
+    {
+        segments.push((is_highlight, render_class, String::new()));
+    }
+    let (_, _, target) = segments.last_mut().expect("segment just pushed");
+    target.push(c);
+    *visible_width += 1;
+    *absolute_col += 1;
 }
 
 fn skipped_prefix_len(line_idx: usize, bytes: &[u8]) -> usize {
@@ -1206,26 +1363,7 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                     match key.code {
                         KeyCode::Char('q') => break,
                         KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
-                            if let Some((start, end)) = viewer.selection_range() {
-                                let copied =
-                                    String::from_utf8_lossy(&viewer.view_bytes()[start..end])
-                                        .to_string();
-                                if let Some(cb) = clipboard.as_mut() {
-                                    if cb.set_text(copied).is_ok() {
-                                        viewer.status_message = Some(format!(
-                                            "Copied {} bytes to clipboard",
-                                            end - start
-                                        ));
-                                    } else {
-                                        viewer.status_message = Some(
-                                            "Failed to copy selection to clipboard".to_string(),
-                                        );
-                                    }
-                                } else {
-                                    viewer.status_message = Some(
-                                        "Clipboard unavailable in this environment".to_string(),
-                                    );
-                                }
+                            if copy_selection_to_clipboard(viewer, &mut clipboard) {
                                 needs_redraw = true;
                             }
                         }
@@ -1365,9 +1503,20 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                                     let col = viewer.left_col + mouse.column as usize;
                                     let offset = viewer.offset_for_line_col(line_idx, col);
                                     viewer.cursor_offset = offset;
-                                    viewer.selection_anchor = Some(offset);
-                                    viewer.selection_focus = Some(offset);
-                                    viewer.status_message = Some("Selecting text…".to_string());
+                                    if mouse.modifiers.contains(KeyModifiers::CONTROL) {
+                                        viewer.selection_anchor = None;
+                                        viewer.selection_focus = None;
+                                        viewer.block_selection_anchor = Some((line_idx, col));
+                                        viewer.block_selection_focus = Some((line_idx, col));
+                                        viewer.status_message =
+                                            Some("Selecting block…".to_string());
+                                    } else {
+                                        viewer.block_selection_anchor = None;
+                                        viewer.block_selection_focus = None;
+                                        viewer.selection_anchor = Some(offset);
+                                        viewer.selection_focus = Some(offset);
+                                        viewer.status_message = Some("Selecting text…".to_string());
+                                    }
                                     needs_redraw = true;
                                 }
                             }
@@ -1384,7 +1533,11 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                                     let col = viewer.left_col + mouse.column as usize;
                                     let offset = viewer.offset_for_line_col(line_idx, col);
                                     viewer.cursor_offset = offset;
-                                    viewer.selection_focus = Some(offset);
+                                    if viewer.block_selection_anchor.is_some() {
+                                        viewer.block_selection_focus = Some((line_idx, col));
+                                    } else {
+                                        viewer.selection_focus = Some(offset);
+                                    }
                                     needs_redraw = true;
                                 }
                             }
@@ -1393,13 +1546,25 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                             scrollbar_drag = false;
                             if selection_drag {
                                 selection_drag = false;
-                                viewer.status_message =
+                                viewer.status_message = if viewer.block_selection_range().is_some()
+                                {
+                                    Some(
+                                        "Block selected. Right-click or Ctrl+C to copy."
+                                            .to_string(),
+                                    )
+                                } else {
                                     viewer.selection_range().map(|(start, end)| {
                                         format!(
                                             "Selected {} bytes. Press Ctrl+C to copy.",
                                             end - start
                                         )
-                                    });
+                                    })
+                                };
+                                needs_redraw = true;
+                            }
+                        }
+                        MouseEventKind::Down(MouseButton::Right) => {
+                            if copy_selection_to_clipboard(viewer, &mut clipboard) {
                                 needs_redraw = true;
                             }
                         }
@@ -1420,6 +1585,52 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
     }
 
     Ok(())
+}
+
+fn copy_selection_to_clipboard(viewer: &mut Viewer, clipboard: &mut Option<Clipboard>) -> bool {
+    if let Some((top, bottom, left, right)) = viewer.block_selection_range() {
+        let mut text = String::new();
+        for line_idx in top..=bottom {
+            if line_idx >= viewer.line_count() {
+                break;
+            }
+            let chars = viewer.line_display_chars(line_idx);
+            let start = left.min(chars.len());
+            let end = (right + 1).min(chars.len());
+            if start < end {
+                text.extend(chars[start..end].iter());
+            }
+            if line_idx < bottom {
+                text.push('\n');
+            }
+        }
+        if let Some(cb) = clipboard.as_mut() {
+            if cb.set_text(text).is_ok() {
+                viewer.status_message = Some("Copied block selection to clipboard".to_string());
+            } else {
+                viewer.status_message = Some("Failed to copy selection to clipboard".to_string());
+            }
+        } else {
+            viewer.status_message = Some("Clipboard unavailable in this environment".to_string());
+        }
+        return true;
+    }
+
+    let Some((start, end)) = viewer.selection_range() else {
+        return false;
+    };
+
+    let copied = String::from_utf8_lossy(&viewer.view_bytes()[start..end]).to_string();
+    if let Some(cb) = clipboard.as_mut() {
+        if cb.set_text(copied).is_ok() {
+            viewer.status_message = Some(format!("Copied {} bytes to clipboard", end - start));
+        } else {
+            viewer.status_message = Some("Failed to copy selection to clipboard".to_string());
+        }
+    } else {
+        viewer.status_message = Some("Clipboard unavailable in this environment".to_string());
+    }
+    true
 }
 
 mod ui;
