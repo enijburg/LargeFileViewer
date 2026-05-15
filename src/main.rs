@@ -7,10 +7,11 @@ use std::{
 };
 
 use anyhow::{Context, Result};
+use arboard::Clipboard;
 use clap::Parser;
 use crossterm::{
     cursor,
-    event::{self, Event, KeyCode, KeyEventKind, MouseButton, MouseEventKind},
+    event::{self, Event, KeyCode, KeyEventKind, KeyModifiers, MouseButton, MouseEventKind},
     execute, queue,
     style::{self, Color, Stylize},
     terminal::{self, ClearType},
@@ -61,6 +62,10 @@ struct Viewer {
     json_syntax_highlighting: bool,
     search_query: Option<Vec<u8>>,
     match_range: Option<(usize, usize)>,
+    cursor_offset: usize,
+    selection_anchor: Option<usize>,
+    selection_focus: Option<usize>,
+    status_message: Option<String>,
 }
 
 #[derive(Clone, Copy, Debug, PartialEq, Eq)]
@@ -195,6 +200,10 @@ impl Viewer {
             json_syntax_highlighting,
             search_query: None,
             match_range: None,
+            cursor_offset: 0,
+            selection_anchor: None,
+            selection_focus: None,
+            status_message: None,
         })
     }
 
@@ -310,7 +319,10 @@ impl Viewer {
 
         self.render_scrollbar(out, width, body_rows)?;
 
-        let footer = "Memory-mapped view (renders visible window only)";
+        let footer = self
+            .status_message
+            .as_deref()
+            .unwrap_or("Memory-mapped view (renders visible window only)");
         let clipped_footer = clip_to_width(footer, width);
         let y = height.saturating_sub(1);
         queue!(
@@ -340,6 +352,13 @@ impl Viewer {
             }
         });
 
+        let selection = self.selection_range().and_then(|(start, end)| {
+            if start < line_end && end > line_start {
+                Some((start, end))
+            } else {
+                None
+            }
+        });
         let bytes = &view_bytes[line_start..line_end];
         let content_start = skipped_prefix_len(line_idx, bytes);
         let mut segments: Vec<(bool, RenderClass, String)> = Vec::new();
@@ -389,9 +408,13 @@ impl Viewer {
                 }
 
                 let absolute_idx = line_start + idx;
-                let is_highlight = highlight
+                let is_selected = selection
                     .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
                     .unwrap_or(false);
+                let is_highlight = is_selected
+                    || highlight
+                        .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
+                        .unwrap_or(false);
 
                 match b {
                     b if b == separator => {
@@ -427,9 +450,13 @@ impl Viewer {
                 }
 
                 let absolute_idx = line_start + idx;
-                let is_highlight = highlight
+                let is_selected = selection
                     .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
                     .unwrap_or(false);
+                let is_highlight = is_selected
+                    || highlight
+                        .map(|(start, end)| absolute_idx >= start && absolute_idx < end)
+                        .unwrap_or(false);
                 let render_class = if self.json_syntax_highlighting {
                     match json_classes
                         .get(idx)
@@ -646,6 +673,46 @@ impl Viewer {
             .windows(query.len())
             .rposition(|window| window == query)
             .map(|found_start| (found_start, found_start + query.len()))
+    }
+
+    fn selection_range(&self) -> Option<(usize, usize)> {
+        let (a, b) = (self.selection_anchor?, self.selection_focus?);
+        if a == b {
+            None
+        } else {
+            Some((a.min(b), a.max(b)))
+        }
+    }
+
+    fn clear_selection(&mut self) {
+        self.selection_anchor = None;
+        self.selection_focus = None;
+    }
+
+    fn offset_for_line_col(&self, line_idx: usize, target_col: usize) -> usize {
+        let view = self.view_bytes();
+        let line_start = *self.line_offsets.get(line_idx).unwrap_or(&0);
+        let line_end = if line_idx + 1 < self.line_offsets.len() {
+            self.line_offsets[line_idx + 1]
+        } else {
+            view.len()
+        };
+        let bytes = &view[line_start..line_end];
+        let mut visual_col = 0usize;
+        for (idx, &b) in bytes
+            .iter()
+            .enumerate()
+            .skip(skipped_prefix_len(line_idx, bytes))
+        {
+            if b == b'\n' || b == b'\r' {
+                continue;
+            }
+            if visual_col >= target_col {
+                return line_start + idx;
+            }
+            visual_col += if b == b'\t' { self.tab_width } else { 1 };
+        }
+        line_end.saturating_sub(1)
     }
 }
 
@@ -1121,6 +1188,8 @@ fn main() -> Result<()> {
 fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
     let mut needs_redraw = true;
     let mut scrollbar_drag = false;
+    let mut selection_drag = false;
+    let mut clipboard = Clipboard::new().ok();
 
     loop {
         if needs_redraw {
@@ -1135,6 +1204,30 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                     let page = height.saturating_sub(2) as usize;
                     match key.code {
                         KeyCode::Char('q') => break,
+                        KeyCode::Char('c') if key.modifiers.contains(KeyModifiers::CONTROL) => {
+                            if let Some((start, end)) = viewer.selection_range() {
+                                let copied =
+                                    String::from_utf8_lossy(&viewer.view_bytes()[start..end])
+                                        .to_string();
+                                if let Some(cb) = clipboard.as_mut() {
+                                    if cb.set_text(copied).is_ok() {
+                                        viewer.status_message = Some(format!(
+                                            "Copied {} bytes to clipboard",
+                                            end - start
+                                        ));
+                                    } else {
+                                        viewer.status_message = Some(
+                                            "Failed to copy selection to clipboard".to_string(),
+                                        );
+                                    }
+                                } else {
+                                    viewer.status_message = Some(
+                                        "Clipboard unavailable in this environment".to_string(),
+                                    );
+                                }
+                                needs_redraw = true;
+                            }
+                        }
                         KeyCode::Char('g') => {
                             if let Some(line_number) = prompt_goto_line(viewer, out)? {
                                 let target_line = line_number
@@ -1193,10 +1286,32 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                         }
                         KeyCode::Left => {
                             viewer.scroll_left(1);
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                let anchor =
+                                    viewer.selection_anchor.unwrap_or(viewer.cursor_offset);
+                                viewer.cursor_offset = viewer.cursor_offset.saturating_sub(1);
+                                viewer.selection_anchor = Some(anchor);
+                                viewer.selection_focus = Some(viewer.cursor_offset);
+                            } else {
+                                viewer.clear_selection();
+                                viewer.cursor_offset = viewer.cursor_offset.saturating_sub(1);
+                            }
                             needs_redraw = true;
                         }
                         KeyCode::Right => {
                             viewer.scroll_right(1);
+                            if key.modifiers.contains(KeyModifiers::SHIFT) {
+                                let anchor =
+                                    viewer.selection_anchor.unwrap_or(viewer.cursor_offset);
+                                viewer.cursor_offset =
+                                    (viewer.cursor_offset + 1).min(viewer.view_bytes().len());
+                                viewer.selection_anchor = Some(anchor);
+                                viewer.selection_focus = Some(viewer.cursor_offset);
+                            } else {
+                                viewer.clear_selection();
+                                viewer.cursor_offset =
+                                    (viewer.cursor_offset + 1).min(viewer.view_bytes().len());
+                            }
                             needs_redraw = true;
                         }
                         KeyCode::Up => {
@@ -1240,12 +1355,52 @@ fn run_event_loop(viewer: &mut Viewer, out: &mut impl Write) -> Result<()> {
                             viewer.scroll_to_scrollbar_row(mouse.row as usize, body_rows);
                             needs_redraw = true;
                         }
+                        MouseEventKind::Down(MouseButton::Left) => {
+                            selection_drag = true;
+                            let row = mouse.row as usize;
+                            if row > 0 && row <= body_rows {
+                                let line_idx = viewer.top_line + row - 1;
+                                if line_idx < viewer.line_count() {
+                                    let col = viewer.left_col + mouse.column as usize;
+                                    let offset = viewer.offset_for_line_col(line_idx, col);
+                                    viewer.cursor_offset = offset;
+                                    viewer.selection_anchor = Some(offset);
+                                    viewer.selection_focus = Some(offset);
+                                    viewer.status_message = Some("Selecting text…".to_string());
+                                    needs_redraw = true;
+                                }
+                            }
+                        }
                         MouseEventKind::Drag(MouseButton::Left) if scrollbar_drag => {
                             viewer.scroll_to_scrollbar_row(mouse.row as usize, body_rows);
                             needs_redraw = true;
                         }
+                        MouseEventKind::Drag(MouseButton::Left) if selection_drag => {
+                            let row = mouse.row as usize;
+                            if row > 0 && row <= body_rows {
+                                let line_idx = viewer.top_line + row - 1;
+                                if line_idx < viewer.line_count() {
+                                    let col = viewer.left_col + mouse.column as usize;
+                                    let offset = viewer.offset_for_line_col(line_idx, col);
+                                    viewer.cursor_offset = offset;
+                                    viewer.selection_focus = Some(offset);
+                                    needs_redraw = true;
+                                }
+                            }
+                        }
                         MouseEventKind::Up(MouseButton::Left) => {
                             scrollbar_drag = false;
+                            if selection_drag {
+                                selection_drag = false;
+                                viewer.status_message =
+                                    viewer.selection_range().map(|(start, end)| {
+                                        format!(
+                                            "Selected {} bytes. Press Ctrl+C to copy.",
+                                            end - start
+                                        )
+                                    });
+                                needs_redraw = true;
+                            }
                         }
                         MouseEventKind::ScrollDown => {
                             viewer.scroll_down(3, body_rows);
